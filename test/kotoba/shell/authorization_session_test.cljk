@@ -1,0 +1,170 @@
+(ns kotoba.shell.authorization-session-test
+  "auth/open-authorization-url on iOS and Android (system-browser OAuth,
+  RFC 8252): manifest validation, policy, and what the scaffold generates.
+
+  Portable on purpose — no clojure.java.io — so it runs on the kbb engine,
+  where launcher_test.cljk still stops at load:
+
+    kbb --backend sci --config nbb.edn --classpath src:resources:test \\
+        -e \"(require 'kotoba.shell.authorization-session-test)
+             (kotoba.shell.authorization-session-test/-main)\""
+  (:require [json.data-json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing] :as t]
+            [kotoba.shell.launcher :as launcher]
+            [kotoba.shell.native-bridge :as bridge]))
+
+(def command "auth/open-authorization-url")
+
+(def base-manifest
+  {:app/id "app.aozora" :app/name "aozora" :app/version "0.1.0"
+   :ios/bundle-id "app.aozora" :android/application-id "app.aozora"})
+
+(def declared
+  (assoc base-manifest
+         :ios/oauth-callback-scheme "app.aozora"
+         :android/oauth-callback-scheme "app.aozora"))
+
+(defn- files [target manifest]
+  (into {} (launcher/scaffold-files target manifest {:allow [command] :deny []})))
+
+(deftest one-command-name-on-every-bridge-target
+  (is (some #{command} bridge/bridge-provider-commands))
+  (is (= command bridge/authorization-command)))
+
+(deftest the-callback-scheme-comes-from-a-per-target-manifest-key
+  (is (= "app.aozora" (bridge/oauth-callback-scheme :ios declared)))
+  (is (= "app.aozora" (bridge/oauth-callback-scheme :android declared)))
+  (is (nil? (bridge/oauth-callback-scheme :ios base-manifest)))
+  (testing "each target reads only its own key"
+    (is (nil? (bridge/oauth-callback-scheme
+               :android (assoc base-manifest :ios/oauth-callback-scheme "app.aozora"))))))
+
+(deftest manifest-scheme-validation
+  (testing "acceptable"
+    (doseq [s [nil "app.aozora" "cloud.murakumo.app" "cloud.itonami.app" "dev.kotoba.demo+x-1"]]
+      (is (nil? (bridge/oauth-callback-scheme-problem s)) (pr-str s))))
+  (testing "refused, each for a named reason"
+    (doseq [[s problem] [["" :not-a-lowercase-uri-scheme]
+                         ["App.Aozora" :not-a-lowercase-uri-scheme]
+                         ["app.aozora://" :not-a-lowercase-uri-scheme]
+                         ["1app.x" :not-a-lowercase-uri-scheme]
+                         ["app\"/><evil" :not-a-lowercase-uri-scheme]
+                         ["https" :reserved-scheme]
+                         ["kotoba-webbundle" :reserved-scheme]
+                         ["myapp" :not-a-reversed-domain]
+                         [:app.aozora :not-a-string]]]
+      (is (= problem (bridge/oauth-callback-scheme-problem s)) (pr-str s))))
+  (testing "scaffold refuses before generating anything"
+    (doseq [target [:ios :android]]
+      (let [k (get bridge/oauth-callback-scheme-keys target)
+            row (launcher/scaffold-target-row
+                 "target/never-written" (assoc base-manifest k "https")
+                 {:allow [] :deny []} target)]
+        (is (false? (:ok? row)) (str target))
+        (is (= :manifest-invalid (:reason row)) (str target))
+        (is (= [{:key k :value "https" :problem :reserved-scheme}]
+               (:invalid-manifest-keys row))
+            (str target))))))
+
+(deftest denied-unless-the-policy-names-it
+  (testing "the CLI's default policy does not allow it"
+    (let [default (launcher/provider-policy [])]
+      (doseq [target [:ios :android :macos]]
+        (is (false? (:allowed? (launcher/policy-decision default target command))) (str target)))))
+  (testing "it has no provider-catalog capability, so only the command or * allows it"
+    (is (nil? (:capability (launcher/policy-decision {:allow [command]} :ios command))))
+    (is (true? (:allowed? (launcher/policy-decision {:allow [command]} :ios command))))
+    (is (false? (:allowed? (launcher/policy-decision {:allow ["auth/*"]} :ios command))))
+    (is (false? (:allowed? (launcher/policy-decision {:allow ["*"] :deny [command]} :android command)))))
+  (testing "the in-app policy asset carries it, and only when the policy does"
+    (let [allowed (json/read-str (launcher/bridge-policy-json :ios {:allow [command] :deny []}))
+          absent (json/read-str (launcher/bridge-policy-json :ios {:allow ["http/fetch"] :deny []}))]
+      (is (some #{command} (get allowed "allow")))
+      (is (not (some #{command} (get absent "allow")))))))
+
+(deftest native-evaluators-agree-with-the-cli-for-the-authorization-command
+  ;; The same clause both KotobaShellBridge.swift and .java evaluate, applied
+  ;; to the generated asset, against the CLI's own decision.
+  (doseq [policy [{:allow [command] :deny []}
+                  {:allow ["*"] :deny []}
+                  {:allow ["*"] :deny [command]}
+                  {:allow [] :deny ["*"]}
+                  {:allow ["clipboard/text"] :deny []}]
+          target [:ios :android :macos]]
+    (let [asset (json/read-str (launcher/bridge-policy-json target policy))
+          allow (set (get asset "allow"))
+          deny (set (get asset "deny"))
+          tokens (remove nil? [command (get (get asset "capabilities") command) "*"])
+          native? (and (not-any? deny tokens) (boolean (some allow tokens)))]
+      (is (= (:allowed? (launcher/policy-decision policy target command)) native?)
+          (str target " " (pr-str policy))))))
+
+(deftest ios-scaffold-carries-the-session-with-the-manifest-scheme
+  (let [with (get (files :ios declared) "Sources/KotobaShellBridge.swift")
+        without (get (files :ios base-manifest) "Sources/KotobaShellBridge.swift")
+        project (get (files :ios declared) "project.yml")]
+    (is (str/includes? with "private let oauthCallbackScheme = \"app.aozora\""))
+    (is (str/includes? without "private let oauthCallbackScheme = \"\"")
+        "undeclared -> empty -> scheme-not-configured, never a guessed scheme")
+    (doseq [needle ["import AuthenticationServices"
+                    "ASWebAuthenticationSession("
+                    "case KotobaShellBridge.authorizationCommand"
+                    "prefersEphemeralWebBrowserSession = true"
+                    "private var authSession: ASWebAuthenticationSession?"
+                    "refused(\"busy\")"
+                    "refused(\"cancelled\")"
+                    "refused(\"scheme-mismatch\")"
+                    "refused(\"scheme-not-configured\")"
+                    "url.scheme?.lowercased() == \"https\""
+                    "isKeyWindow"]]
+      (is (str/includes? with needle) needle))
+    (is (not (str/includes? with "{{")) "every placeholder substituted")
+    (is (str/includes? project "AuthenticationServices.framework"))))
+
+(deftest android-scaffold-generates-the-redirect-receiver-only-when-declared
+  (let [on (files :android declared)
+        off (files :android base-manifest)
+        activity "app/src/main/java/app/aozora/KotobaShellAuthCallbackActivity.java"
+        manifest-xml "app/src/main/AndroidManifest.xml"
+        main "app/src/main/java/app/aozora/MainActivity.java"
+        bridge-java "app/src/main/java/app/aozora/KotobaShellBridge.java"]
+    (testing "declared"
+      (is (contains? on activity))
+      (is (str/includes? (get on activity) "CustomTabsIntent"))
+      (is (str/includes? (get on activity) "Intent.ACTION_VIEW")
+          "falls back to the default browser without a Custom Tabs provider")
+      (is (not (str/includes? (get on activity) "{{")))
+      (is (str/includes? (get on manifest-xml) "android:name=\".KotobaShellAuthCallbackActivity\""))
+      (is (str/includes? (get on manifest-xml) "<data android:scheme=\"app.aozora\" />"))
+      (is (str/includes? (get on manifest-xml) "android.intent.category.BROWSABLE"))
+      (is (str/includes? (get on manifest-xml) "android.support.customtabs.action.CustomTabsService"))
+      (is (str/includes? (get on "app/build.gradle") "androidx.browser:browser:"))
+      (is (str/includes? (get on main) "setAuthorizationLauncher"))
+      (is (str/includes? (get on bridge-java) "OAUTH_CALLBACK_SCHEME = \"app.aozora\"")))
+    (testing "absent: no exported receiver, no intent-filter, no androidx.browser"
+      (is (not (contains? off activity)))
+      (is (not (str/includes? (get off manifest-xml) "KotobaShellAuthCallbackActivity")))
+      (is (not (str/includes? (get off manifest-xml) "BROWSABLE")))
+      (is (not (str/includes? (get off manifest-xml) "<queries>")))
+      (is (not (str/includes? (get off "app/build.gradle") "androidx.browser")))
+      (is (not (str/includes? (get off main) "setAuthorizationLauncher")))
+      (is (str/includes? (get off bridge-java) "OAUTH_CALLBACK_SCHEME = \"\""))
+      (is (str/includes? (get off bridge-java) "\"scheme-not-configured\"")))
+    (testing "both: the bridge resolves through the existing evaluateJavascript reply path"
+      (doseq [f [on off]]
+        (is (str/includes? (get f bridge-java) "AUTHORIZATION_COMMAND.equals(command)"))
+        (is (str/includes? (get f bridge-java) "window.__kotobaShellDeliver("))
+        (is (str/includes? (get f main) "bridge.onHostResume()"))))))
+
+#?(:cljs
+   ;; cljs.test/run-tests returns nil on the kbb engine, so the exit code has
+   ;; to come from the :end-run-tests report (the hook kotoba.test documents).
+   (defmethod t/report [:cljs.test/default :end-run-tests] [m]
+     (when-not (t/successful? m)
+       (set! (.-exitCode js/process) 1))))
+
+(defn -main [& _]
+  (let [summary (t/run-tests 'kotoba.shell.authorization-session-test)]
+    #?(:clj (System/exit (if (t/successful? summary) 0 1))
+       :cljs summary)))

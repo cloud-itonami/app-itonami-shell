@@ -136,8 +136,9 @@ integration did more than once).
   `KotobaShellBridge.swift` (`WKScriptMessageHandlerWithReply`) and
   `KotobaShellBridge.java` (`@JavascriptInterface` + `evaluateJavascript`)
   into the app, reachable from the web bundle as `window.kotobaShell.invoke`
-  and from ClojureScript as `kotoba.shell.client`. Ten commands: clipboard,
-  app-data `fs`, keychain, `http/fetch`, `notify/show`.
+  and from ClojureScript as `kotoba.shell.client`. Eleven commands: clipboard,
+  app-data `fs`, keychain, `http/fetch`, `notify/show`, and
+  `auth/open-authorization-url` (next bullet).
   Policy is enforced **in the app**: `app scaffold` writes the same
   `:allow`/`:deny` map as `Resources/kotoba-shell-policy.json`, both native
   halves reproduce `policy-decision` clause for clause, and a missing policy
@@ -152,6 +153,49 @@ integration did more than once).
   deliberately absent from the bridge; each needs a real per-platform
   integration, and listing them would repeat the mistake the catalog already
   had to correct.
+- **System-browser OAuth (`auth/open-authorization-url`) on iOS and
+  Android.** Until now this existed only in macOS's keychain-cacao
+  AppDelegate; it is now a bridge command on every bridge target. Input
+  `{url, callbackScheme}`; resolves with `value.callbackURL` or `ok: false`
+  and one of `scheme-not-configured`, `scheme-mismatch`, `invalid-url`
+  (not https), `busy` (one session at a time), `cancelled`, `no-browser`,
+  `start-failed`, `policy-denied`. The scheme comes from the manifest —
+  `:ios/oauth-callback-scheme`, `:android/oauth-callback-scheme` (per target,
+  like `:ios/bundle-id` and the existing `:macos/oauth-callback-scheme`) —
+  never from the page; the page's `callbackScheme` is only compared against
+  it. `app scaffold` refuses (`:manifest-invalid`, `:invalid-manifest-keys`)
+  a scheme that is not lowercase, not a reversed domain (RFC 8252 §7.1), or
+  reserved (`https`, `kotoba-webbundle`, …). Denied unless `:allow` names the
+  command or `"*"`: it has no provider-catalog capability, and the CLI's
+  default policy does not list it. iOS uses `ASWebAuthenticationSession`
+  with `prefersEphemeralWebBrowserSession = true` (as macOS: no silent
+  sign-in to whichever account Safari last held, no consent alert; the cost
+  is no SSO with Safari), anchored on the key window. Android opens a Custom
+  Tab (androidx.browser, default browser when no provider) and receives the
+  redirect in `KotobaShellAuthCallbackActivity`; that Activity, its
+  BROWSABLE intent-filter, the `<queries>` entry and the androidx.browser
+  dependency are generated **only** when the scheme is declared.
+  **Verified 2026-10-11** with `test/web/authorization-smoke/` (a public 302
+  to the app's scheme, no IdP): on an iOS 26.5 Simulator,
+  `scheme-mismatch`, `invalid-url` and `busy` refused and the real
+  round-trip resolved with `dev.kotoba.authsmoke://callback?code=smoke&state=xyz`;
+  on an API 34 Emulator the same four plus `cancelled` (BACK out of the
+  Custom Tab), Chrome's `CustomTabActivity` and `MainActivity` reused
+  (`START_DELIVERED_TO_TOP`), and a scheme-less build answering
+  `scheme-not-configured` with no Activity resolving the scheme. The macOS
+  bridge build with the shared Swift also succeeds.
+  **Not verified:** `cancelled` on iOS (nobody tapped the sheet's close
+  button); a real IdP (aozora's PAR+PKCE+DPoP, Google); a device; Android
+  process death while the browser is in front (the redirect is then dropped,
+  not delivered); Chrome's first-run screen was skipped on the emulator with
+  its `--disable-fre` test flag. The emulator-side gradle build needs
+  `JAVA_HOME` at JDK 17 (Homebrew's gradle launches on JDK 26 and fails
+  with `Unsupported class file major version 70`). Unit tests:
+  `test/kotoba/shell/authorization_session_test.cljk` runs on the kbb engine
+  (`kbb --backend sci --config nbb.edn --classpath src:resources:test -e
+  "(require 'kotoba.shell.authorization-session-test)
+  (kotoba.shell.authorization-session-test/-main)"`, 7 tests / 90
+  assertions); the launcher_test.cljk changes are still unrun (see above).
 - **Default CI is `kotoba compile` / guest-run, not `kbb -M`.** Job
   `kotoba-operator` in `.github/workflows/ci.yml` installs Release kotoba
   CLI, compiles `kotoba/launcher.kotoba` to wasm+web, checks files on disk,

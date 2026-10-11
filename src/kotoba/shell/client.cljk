@@ -99,3 +99,18 @@
   presenting a permission prompt mid-call — the host asks once at launch."
   [title body]
   (invoke "notify/show" {:title title :body body}))
+
+(defn open-authorization-url
+  "Opens an OAuth authorization URL in the system browser
+  (ASWebAuthenticationSession / Custom Tabs), never in this WebView, and
+  resolves with `{:callbackURL \"<scheme>:...\"}` as the value — or `ok?`
+  false with `:error` one of `scheme-not-configured`, `scheme-mismatch`,
+  `invalid-url`, `busy`, `cancelled`, `no-browser`, `start-failed`,
+  `policy-denied`.
+
+  `callback-scheme` must equal the scheme the app's manifest declares
+  (`:ios/oauth-callback-scheme`, `:android/oauth-callback-scheme`,
+  `:macos/oauth-callback-scheme`). It does not choose the scheme; it is
+  checked against it, so a bundle built for another app fails loudly."
+  [url callback-scheme]
+  (invoke "auth/open-authorization-url" {:url url :callbackScheme callback-scheme}))

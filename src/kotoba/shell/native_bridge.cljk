@@ -27,6 +27,21 @@
             [kotoba.shell.host :as host]
             [kotoba.lang.text :as str]))
 
+(def authorization-command
+  "System-browser OAuth (RFC 8252): open an authorization URL outside the
+  WebView and resolve with the redirect that comes back to the app.
+
+  One name on every target. macOS's keychain-cacao AppDelegate spells the
+  same capability `open-authorization-url` as a message *action*, not a
+  bridge command; the bridge's commands are `namespace/verb`, so it is
+  `auth/open-authorization-url` here.
+
+  Unlike every other bridge command it is not in the provider catalog:
+  there is no `native-host provider` path for it (a CLI driving `simctl` or
+  `adb` cannot hand a browser redirect back to a page), so its capability is
+  nil and only the command itself or `\"*\"` can allow it."
+  "auth/open-authorization-url")
+
 (def bridge-provider-commands
   "Commands the in-app bridge implements natively on every target it supports.
 
@@ -45,7 +60,8 @@
    "keychain/write-text"
    "keychain/delete"
    "http/fetch"
-   "notify/show"])
+   "notify/show"
+   authorization-command])
 
 (def bridge-targets
   "Targets whose scaffold carries the in-app bridge. Windows' host boundary is
@@ -107,15 +123,79 @@
   (substitute (resource-text "kotoba/shell/app/kotoba_shell_bridge.js")
               {"{{TARGET}}" (name target)}))
 
+(declare oauth-callback-scheme)
+
 (defn apple-bridge-swift
   [target manifest]
   (substitute (resource-text "kotoba/shell/app/kotoba_shell_bridge.swift")
               {"{{KEYCHAIN_SERVICE}}" (keychain-service target manifest)
-               "{{DATA_DIR}}" data-dir-name}))
+               "{{DATA_DIR}}" data-dir-name
+               ;; "" means not configured: the command refuses with
+               ;; scheme-not-configured rather than listening on a guess.
+               "{{OAUTH_CALLBACK_SCHEME}}" (str (oauth-callback-scheme target manifest))}))
 
 (defn android-bridge-java
   [manifest]
   (substitute (resource-text "kotoba/shell/app/KotobaShellBridge.java")
               {"{{PACKAGE}}" (str (:android/application-id manifest))
                "{{KEYCHAIN_PREFS}}" (str (keychain-service :android manifest) ".keychain")
-               "{{DATA_DIR}}" data-dir-name}))
+               "{{DATA_DIR}}" data-dir-name
+               "{{OAUTH_CALLBACK_SCHEME}}" (str (oauth-callback-scheme :android manifest))}))
+
+(defn android-authorization-java
+  "The Custom Tabs launcher and the redirect-receiving Activity. Generated
+  only when `:android/oauth-callback-scheme` is declared: it needs
+  androidx.browser, and an exported Activity with a BROWSABLE intent-filter
+  is attack surface an app that never signs in should not carry."
+  [manifest]
+  (substitute (resource-text "kotoba/shell/app/KotobaShellAuthCallbackActivity.java")
+              {"{{PACKAGE}}" (str (:android/application-id manifest))}))
+
+;; ---------------------------------------------------------------------------
+;; auth/open-authorization-url — the callback scheme
+
+(def oauth-callback-scheme-keys
+  "Per-target manifest key naming the redirect scheme the app listens on.
+
+  Per target rather than one platform-neutral key, following every other
+  identity key in the manifest (`:ios/bundle-id`, `:android/application-id`,
+  and the existing `:macos/oauth-callback-scheme`): RFC 8252 §7.1 wants the
+  scheme to be a reversed domain the app controls, which in practice is the
+  app's own id, and that id is already per target. A consumer whose ids agree
+  writes the same string twice; a consumer whose ids differ is not forced to
+  share a scheme between two different apps."
+  {:macos :macos/oauth-callback-scheme
+   :ios :ios/oauth-callback-scheme
+   :android :android/oauth-callback-scheme})
+
+(defn oauth-callback-scheme
+  "The scheme `target` listens on, or nil when the manifest declares none.
+  Never read from the page: a bundle that could choose its scheme could
+  listen on another app's redirect."
+  [target manifest]
+  (when-let [k (get oauth-callback-scheme-keys target)]
+    (get manifest k)))
+
+(def ^:private reserved-schemes
+  "Schemes an app must not claim as its OAuth redirect: the web's own, the
+  ones the platforms route elsewhere, and the bundle's own origin scheme."
+  #{"http" "https" "file" "about" "data" "blob" "javascript" "content"
+    "intent" "mailto" "tel" "sms" "ftp" "ws" "wss" "kotoba-webbundle"})
+
+(defn oauth-callback-scheme-problem
+  "nil when `scheme` is acceptable (or absent), otherwise a keyword naming
+  what is wrong.
+
+  The value is substituted into Swift, Java and AndroidManifest.xml, so the
+  character set is checked before anything is generated, not after.
+  Lowercase only: RFC 3986 schemes are case-insensitive, Android's
+  intent-filter `<data android:scheme>` match is not. A dot is required
+  because RFC 8252 §7.1 asks for a reversed domain the app controls — a bare
+  word (`myapp`) is exactly the scheme two unrelated apps both register."
+  [scheme]
+  (cond
+    (nil? scheme) nil
+    (not (string? scheme)) :not-a-string
+    (not (re-matches #"[a-z][a-z0-9+.-]*" scheme)) :not-a-lowercase-uri-scheme
+    (contains? reserved-schemes scheme) :reserved-scheme
+    (not (str/includes? scheme ".")) :not-a-reversed-domain))

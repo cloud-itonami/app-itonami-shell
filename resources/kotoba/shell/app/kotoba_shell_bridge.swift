@@ -14,8 +14,9 @@
 // in allow. Deny-by-default: a missing or unreadable policy file allows
 // nothing.
 //
-// {{KEYCHAIN_SERVICE}} / {{DATA_DIR}} are substituted by
-// kotoba.shell.native-bridge/apple-bridge-swift.
+// {{KEYCHAIN_SERVICE}} / {{DATA_DIR}} / {{OAUTH_CALLBACK_SCHEME}} are
+// substituted by kotoba.shell.native-bridge/apple-bridge-swift.
+import AuthenticationServices
 import Foundation
 import Security
 import UserNotifications
@@ -29,10 +30,27 @@ import AppKit
 enum KotobaShellBridgeError: Error {
     case invalidArgument(String)
     case providerFailure(String)
+    /// A typed refusal. Its code is the reply's `error` verbatim
+    /// (`cancelled`, `scheme-mismatch`, ...), so a page can branch on it
+    /// without parsing a Swift enum description.
+    case refused(String)
 }
 
-final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply {
+final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply,
+                               ASWebAuthenticationPresentationContextProviding {
     static let messageName = "kotobaShell"
+    static let authorizationCommand = "auth/open-authorization-url"
+
+    /// The redirect scheme, from the manifest (`:ios/oauth-callback-scheme`
+    /// / `:macos/oauth-callback-scheme`), never from the page. Empty means
+    /// not configured, and the command refuses rather than listening on a
+    /// guess that might be another app's redirect.
+    private let oauthCallbackScheme = "{{OAUTH_CALLBACK_SCHEME}}"
+    /// The session in flight. Held strongly: a session that only a local
+    /// variable references is deallocated and its sheet vanishes at once.
+    /// Also the one-at-a-time lock -- a second request while this is set is
+    /// refused with `busy`.
+    private var authSession: ASWebAuthenticationSession?
 
     private let allow: Set<String>
     private let deny: Set<String>
@@ -170,8 +188,14 @@ final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply {
                 replyHandler(self.envelope(command: command, ok: true, value: value,
                                            error: nil, decision: verdict), nil)
             case .failure(let error):
+                let message: String
+                if case KotobaShellBridgeError.refused(let code) = error {
+                    message = code
+                } else {
+                    message = String(describing: error)
+                }
                 replyHandler(self.envelope(command: command, ok: false, value: nil,
-                                           error: String(describing: error), decision: verdict), nil)
+                                           error: message, decision: verdict), nil)
             }
         }
     }
@@ -208,6 +232,8 @@ final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply {
                 completion(.success(["deleted": true]))
             case "http/fetch":
                 httpFetch(args, completion: completion)
+            case KotobaShellBridge.authorizationCommand:
+                openAuthorizationURL(args, completion: completion)
             case "notify/show":
                 notify(title: try stringArg(args, "title"),
                        body: (args["body"] as? String) ?? "",
@@ -349,6 +375,92 @@ final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply {
                 "body": String(data: data ?? Data(), encoding: .utf8) ?? ""
             ]))
         }.resume()
+    }
+
+    // MARK: auth/open-authorization-url
+    //
+    // OAuth must not run in this WebView (RFC 8252 §8.12): an IdP page inside
+    // a view the app controls lets the app read the credentials typed into
+    // it, and Google refuses embedded user agents outright
+    // (disallowed_useragent). ASWebAuthenticationSession runs the page in a
+    // browser process the app cannot script.
+    //
+    // The bridge decides nothing about the OAuth exchange. It opens the URL
+    // and hands the redirect back verbatim; state, PKCE, DPoP and token
+    // exchange stay in the page, where the same code runs on every target.
+
+    private func openAuthorizationURL(_ args: [String: Any],
+                                      completion: @escaping (Result<Any, Error>) -> Void) {
+        guard !oauthCallbackScheme.isEmpty else {
+            completion(.failure(KotobaShellBridgeError.refused("scheme-not-configured")))
+            return
+        }
+        // The page names the scheme it expects so that a bundle built for
+        // one app and run inside another fails loudly instead of waiting on
+        // a redirect that will never arrive here.
+        guard let requested = args["callbackScheme"] as? String,
+              requested.lowercased() == oauthCallbackScheme else {
+            completion(.failure(KotobaShellBridgeError.refused("scheme-mismatch")))
+            return
+        }
+        // https only: anything else would make this an open launcher for
+        // whatever URL an injected script supplies.
+        guard let urlString = args["url"] as? String,
+              let url = URL(string: urlString), url.scheme?.lowercased() == "https" else {
+            completion(.failure(KotobaShellBridgeError.refused("invalid-url")))
+            return
+        }
+        guard authSession == nil else {
+            completion(.failure(KotobaShellBridgeError.refused("busy")))
+            return
+        }
+        let session = ASWebAuthenticationSession(
+            url: url,
+            callbackURLScheme: oauthCallbackScheme) { [weak self] callbackURL, error in
+                DispatchQueue.main.async {
+                    self?.authSession = nil
+                    if let error = error {
+                        let code = (error as? ASWebAuthenticationSessionError)?.code
+                        completion(.failure(code == .canceledLogin
+                            ? KotobaShellBridgeError.refused("cancelled")
+                            : KotobaShellBridgeError.providerFailure(error.localizedDescription)))
+                        return
+                    }
+                    guard let callbackURL = callbackURL else {
+                        completion(.failure(KotobaShellBridgeError.refused("cancelled")))
+                        return
+                    }
+                    completion(.success(["callbackURL": callbackURL.absoluteString]))
+                }
+            }
+        session.presentationContextProvider = self
+        // Ephemeral, as on macOS. With a shared session the browser's
+        // cookies sign the user straight back into whichever account it last
+        // saw, which for a multi-account product (aozora: several PDS
+        // accounts) is a silent wrong-account sign-in. It also removes iOS's
+        // "wants to use … to Sign In" consent alert, which only exists
+        // because a shared session can read the browser's cookies. The cost:
+        // no SSO with Safari, the user types (or autofills) credentials.
+        session.prefersEphemeralWebBrowserSession = true
+        authSession = session
+        if !session.start() {
+            authSession = nil
+            completion(.failure(KotobaShellBridgeError.refused("start-failed")))
+        }
+    }
+
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        #if os(iOS)
+        // The key window: the sheet is presented over whatever the user is
+        // looking at. Scaffolded iOS apps have no scene manifest, but iOS 13+
+        // still attaches their window to a UIWindowScene.
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+        return windows.first(where: { $0.isKeyWindow }) ?? windows.first ?? ASPresentationAnchor()
+        #else
+        return NSApp.keyWindow ?? NSApp.windows.first ?? ASPresentationAnchor()
+        #endif
     }
 
     // MARK: notifications

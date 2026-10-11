@@ -8,6 +8,7 @@
             [kotoba.shell.input-test]
             [kotoba.shell.sidecar-test]
             [kotoba.shell.mangaka-app-test]
+            [kotoba.shell.authorization-session-test]
             [kotoba.shell.experience :as experience]
             [kotoba.shell.sealed-line :as sealed]
             [kotoba.shell.tamaki-observer :as tamaki-observer]
@@ -1666,7 +1667,8 @@
   ;; The bridge enforces policy inside the app, so there are now two
   ;; evaluators. They have to agree: a command allowed by one and denied by
   ;; the other is a security hole in whichever direction it leans.
-  (let [policy {:allow ["clipboard/text" "fs/read-text" "http/fetch"]
+  (let [policy {:allow ["clipboard/text" "fs/read-text" "http/fetch"
+                        "auth/open-authorization-url"]
                 :deny ["fs/write-text"]}]
     (doseq [target [:ios :android :macos]]
       (let [asset (json/read-str (launcher/bridge-policy-json target policy))
@@ -1815,5 +1817,6 @@
                                 'kotoba.shell.sidecar-test
                                 'kotoba.shell.event-test
                                 'kotoba.shell.input-test
-                                'kotoba.shell.mangaka-app-test)]
+                                'kotoba.shell.mangaka-app-test
+                                'kotoba.shell.authorization-session-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
