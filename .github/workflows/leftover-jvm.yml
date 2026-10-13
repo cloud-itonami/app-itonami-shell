@@ -35,8 +35,8 @@ jobs:
           path: orgs/kotoba-lang/browser
       - uses: actions/checkout@v4
         with:
-          repository: kotoba-lang/aiueos
-          path: orgs/kotoba-lang/aiueos
+          repository: kotoba-lang/grant
+          path: orgs/kotoba-lang/grant
       - uses: actions/checkout@v4
         with:
           repository: kotoba-lang/kototama
