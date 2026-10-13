@@ -3699,7 +3699,7 @@
                  {:source-path source-path
                   :app-source-path app-source-path
                   :wasm-path wasm-path
-                  :aiueos-dir (sibling-path "../aiueos")
+                  :grant-dir (sibling-path "../grant")
                   :kototama-dir (sibling-path "../kototama")
                   :kotobase-dir (sibling-path "../kotobase")
                   :correlation-id (or (option-value argv "--correlation-id")

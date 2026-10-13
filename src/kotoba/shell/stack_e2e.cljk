@@ -1,5 +1,5 @@
 (ns kotoba.shell.stack-e2e
-  "Load-bearing process-boundary slice: aiueos decides, kototama executes,
+  "Load-bearing process-boundary slice: grant decides, kototama executes,
    shell commits, and kotobase persists one correlated receipt."
   (:require [kotoba.lang.edn :as edn]
             [kotoba.shell.host :as host]
@@ -29,8 +29,29 @@
            (keep #(try (edn/read-string %) (catch #?(:clj Exception :cljs :default) _ nil)))
            last))
 
+(def grant-expr
+  "The decision participant, evaluated by `kbb -M -e` in a kotoba-lang/grant
+  checkout. Grant decisions moved out of aiueos into grant on 2026-08-21
+  (root ADR-2608219500; aiueos dc5e5b3d71 deleted `aiueos.cli`), so this asks
+  `grant.cli/command-result :verify`.
+
+  `grant.cli/read-contract` is JVM-only and kbb is SCI on Node, so the
+  contract is rebuilt here the way that function does it: read the
+  `grant.cli/default-contract-resource` tx-data off the classpath, drop
+  `:db/id`, and re-read every pr-str'd collection value. The request and the
+  `:aiueos/decision` answer are grant's own `:aiueos/*` EDN, unchanged."
+  (str "(require '[grant.cli :as c] '[kotoba.io :as io] '[kotoba.lang.edn :as edn]) "
+       "(let [unblob (fn [v] (if (string? v) "
+       "(let [p (try (edn/read-string v) (catch :default _ v))] (if (coll? p) p v)) v)) "
+       "contract (into {} (map (fn [[k v]] [k (unblob v)])) "
+       "(dissoc (first (edn/read-string (slurp (io/resource c/default-contract-resource)))) :db/id))] "
+       "(println (pr-str (c/command-result contract :verify "
+       "{:aiueos/manifest {:aiueos/component :kotoba-shell/e2e "
+       ":aiueos/kind :service :aiueos/trust :verified "
+       ":aiueos/imports #{} :aiueos/exports #{}}}))))"))
+
 (defn run
-  [{:keys [wasm-path source-path app-source-path aiueos-dir kototama-dir kotobase-dir
+  [{:keys [wasm-path source-path app-source-path grant-dir kototama-dir kotobase-dir
            shell-commit store-instance correlation-id]
     :or {correlation-id "kotoba-shell-stack-e2e"}}]
   (host/load-source-file (str (host/file kotobase-dir "src/kotobase/store.cljc")))
@@ -39,16 +60,11 @@
         append! (ns-resolve 'kotobase.store '-append)
         read! (ns-resolve 'kotobase.store '-read)
         db (or store-instance (local-store))
-        ai-expr (str "(require '[aiueos.cli :as c]) (println (pr-str "
-                     "(c/command-result (c/read-contract) :verify "
-                     "{:aiueos/manifest {:aiueos/component :kotoba-shell/e2e "
-                     ":aiueos/kind :service :aiueos/trust :verified "
-                     ":aiueos/imports #{} :aiueos/exports #{}}})))")
-        ai-run (subprocess aiueos-dir ["kbb" "-M" "-e" ai-expr])
-        ai-result (last-edn (:output ai-run))
-        granted? (and (not (:timed-out? ai-run))
-                      (zero? (:exit ai-run))
-                      (= :grant (:aiueos/decision ai-result)))
+        grant-run (subprocess grant-dir ["kbb" "-M" "-e" grant-expr])
+        grant-result (last-edn (:output grant-run))
+        granted? (and (not (:timed-out? grant-run))
+                      (zero? (:exit grant-run))
+                      (= :grant (:aiueos/decision grant-result)))
         ;; A cold kototama/Clojure dependency cache can exceed one minute on
         ;; CI and fresh workstations. Keep the generic participant timeout
         ;; tight, but give the compiler-backed tender boundary three minutes.
@@ -64,8 +80,8 @@
         receipt {:schema stack-schema :correlation-id correlation-id
                  :source {:path source-path :present? (.isFile (host/file source-path))}
                  :app-source {:path app-source-path :present? (.isFile (host/file app-source-path))}
-                 :aiueos {:granted? granted? :exit (:exit ai-run)
-                          :timed-out? (:timed-out? ai-run)}
+                 :grant {:granted? granted? :exit (:exit grant-run)
+                         :timed-out? (:timed-out? grant-run)}
                  :kototama {:ok? (boolean guest-ok?) :result (when guest-ok? 120)
                             :exit (:exit tender-run)
                             :timed-out? (:timed-out? tender-run)}

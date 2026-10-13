@@ -527,12 +527,18 @@ only runs that command when `--execute` is present.
 asked for, kototama executes a checked-in Kotoba-compiled Wasm guest, shell
 commits `kotoba:dom` operations, and kotobase appends then reads back one
 correlated receipt. The decision step (`src/kotoba/shell/stack_e2e.cljk`) runs
-`kbb -M -e` in the sibling aiueos checkout and calls
-`aiueos.cli/command-result :verify`. Since root ADR-2608219500 (2026-08-21)
-grant decisions belong to `kotoba-lang/grant`: aiueos removed `aiueos.cli` that
-day and the decision now lives in `grant.cli/command-result`. Against a current
-aiueos checkout the step therefore fails closed (`:aiueos {:granted? false}`,
-`:ready? false`) until the call is pointed at `grant.cli`. `resources/kotoba/shell/app/tauri_equivalent.kotoba` is the
+`kbb -M -e` in the sibling `../grant` checkout and calls
+`grant.cli/command-result :verify`; the receipt records it as
+`:grant {:granted? ...}`. Grant decisions moved from aiueos to
+`kotoba-lang/grant` under root ADR-2608219500 (2026-08-21), when aiueos removed
+`aiueos.cli`. `grant.cli/read-contract` is JVM-only, so the step rebuilds the
+contract from grant's `aiueos/cli.edn` classpath resource itself. Run alone on
+2026-10-13 it returned `:aiueos/decision :grant`. The whole command does not
+complete on the kbb engine yet: kotobase is loaded first through
+`host/load-source-file`, which is JVM-only and throws there, and kototama's
+`kbb -M:cli run` stops at `Unable to resolve classname:
+com.dylibso.chicory.runtime.ExecutionListener`.
+`resources/kotoba/shell/app/tauri_equivalent.kotoba` is the
 Kotoba-owned application readiness source. `app run --execute` is the macOS T1
 path for manifest applications: it evaluates the declared pure app entry,
 passes its `kotoba:dom` operations to the shell-owned AppKit host, and records
