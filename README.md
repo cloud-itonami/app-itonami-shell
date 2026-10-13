@@ -523,10 +523,16 @@ as warnings, while `--strict` is intended for CI/device-farm gates.
 iOS/Android device readiness with an optional external device-farm command and
 only runs that command when `--execute` is present.
 
-`e2e stack` closes the load-bearing reference loop: aiueos makes a real grant
-decision, kototama executes a checked-in Kotoba-compiled Wasm guest, shell
+`e2e stack` closes the load-bearing reference loop: a real grant decision is
+asked for, kototama executes a checked-in Kotoba-compiled Wasm guest, shell
 commits `kotoba:dom` operations, and kotobase appends then reads back one
-correlated receipt. `resources/kotoba/shell/app/tauri_equivalent.kotoba` is the
+correlated receipt. The decision step (`src/kotoba/shell/stack_e2e.cljk`) runs
+`kbb -M -e` in the sibling aiueos checkout and calls
+`aiueos.cli/command-result :verify`. Since root ADR-2608219500 (2026-08-21)
+grant decisions belong to `kotoba-lang/grant`: aiueos removed `aiueos.cli` that
+day and the decision now lives in `grant.cli/command-result`. Against a current
+aiueos checkout the step therefore fails closed (`:aiueos {:granted? false}`,
+`:ready? false`) until the call is pointed at `grant.cli`. `resources/kotoba/shell/app/tauri_equivalent.kotoba` is the
 Kotoba-owned application readiness source. `app run --execute` is the macOS T1
 path for manifest applications: it evaluates the declared pure app entry,
 passes its `kotoba:dom` operations to the shell-owned AppKit host, and records
