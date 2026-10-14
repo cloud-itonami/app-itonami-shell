@@ -97,7 +97,9 @@ Measured 2026-09-23 on the kbb engine, iOS 26.5 Simulator:
 
 Not measured: `test/kotoba/shell/launcher_test.cljk` and `event_test.cljk`
 require `clojure.java.io` unconditionally, so `kbb -M:test` stops at load
-(`Could not find namespace: clojure.java.io`). Before this change it stopped
+(`Could not find namespace: clojure.java.io`). Re-checked 2026-10-14: loading
+`kotoba.shell.launcher-test` on the kbb engine now stops at
+`Unable to resolve classname: java.util.concurrent.TimeUnit`. Before this change it stopped
 earlier, at `json.data-json`. The suite has no green run on the kbb engine.
 
 ## Status
@@ -196,6 +198,73 @@ integration did more than once).
   "(require 'kotoba.shell.authorization-session-test)
   (kotoba.shell.authorization-session-test/-main)"`, 7 tests / 90
   assertions); the launcher_test.cljk changes are still unrun (see above).
+- **Store readiness of the scaffolded iOS / Android projects (2026-10-14).**
+  Found while building cloud.itonami.app, cloud.murakumo.app and app.aozora
+  for review: no app icon on either platform, an iOS target declaring iPad
+  while portrait-only (fails validation, forces iPad screenshots), build
+  number fixed at 1, a title bar over the WebView on Android 15, a
+  notification prompt at every Android launch, cleartext HTTP allowed,
+  Back closing the app, `mailto:` links doing nothing, and `.well-known/`
+  missing from the APK. Manifest keys (all optional; paths relative to the
+  manifest file):
+
+  | key | default | effect |
+  |---|---|---|
+  | `:ios/icon` | none (store warning) | 1024×1024 PNG **without an alpha channel** → single-size `AppIcon.appiconset`. Scaffold refuses `:icon-file-missing` / `:icon-not-png` / `:icon-not-square` / `:icon-wrong-size` / `:icon-has-alpha` (color type, not pixels — what App Store validation checks). |
+  | `:android/icon` | none | square PNG ≥192 px → `mipmap-*/ic_launcher.png` at 48 dp, every density |
+  | `:android/adaptive-icon` | none | `{:foreground png :background png-or-"#RRGGBB" :monochrome png?}`, layers ≥432 px → 108 dp per density + `mipmap-anydpi-v26` XML (minSdk 26, so this alone covers every device) |
+  | `:ios/device-family` | `[:iphone]` | was XcodeGen's `1,2`. iPhone-only still installs on iPad; opt in with `[:iphone :ipad]` |
+  | `:ios/orientations` | `[:portrait]` | also written as `~ipad`; an iPad target without all four gets `UIRequiresFullScreen` |
+  | `:ios/build-number` | `1` | `CFBundleVersion` + `CURRENT_PROJECT_VERSION` (`:android/version-code` already existed; now validated) |
+  | `:ios/uses-non-exempt-encryption?` | `false` | `ITSAppUsesNonExemptEncryption` |
+  | `:ios/privacy-accessed-api-types` | `[]` | `PrivacyInfo.xcprivacy` (the generated Swift uses no required-reason API) |
+  | `:android/allow-backup?` | `false` | keychain values are wrapped by a non-backed-up Keystore key |
+  | `:android/cleartext-traffic?` | `false` | was always `true`; opt in only for a dev build hitting `10.0.2.2` |
+
+  Android also gets: a `Theme.Material.Light.NoActionBar` theme; the WebView
+  padded by system-bar + cutout + IME insets and the insets consumed (so
+  `env(safe-area-inset-*)` is 0 there rather than double-counted — Android
+  WebView 124 does not map insets to `env()` anyway); `POST_NOTIFICATIONS`
+  declared **only when the policy allows `notify/show`**, requested at the
+  first `notify/show` (the call waits for the answer, up to 300 s) instead
+  of at launch; the notification channel named after the app; system Back
+  → a cancelable `kotobaShell:back` event on `window` (`preventDefault()` =
+  handled) → WebView history → task to back (`OnBackInvokedCallback` on
+  API 33+, `onBackPressed` below); `ignoreAssetsPattern` without aapt's
+  `.*` and `<dir>_*` rules, so `.well-known/` and `_app/` ship. Both
+  platforms: links leaving the bundle (`mailto:` via `ACTION_SENDTO` /
+  `UIApplication.open`, `tel:`, `sms:`, and main-frame or `target=_blank`
+  http(s) to another origin) open in the system handler; the bundle's own
+  origin, `about:`/`blob:`/`data:` and subframes stay in the WebView;
+  anything else is refused. Android icons are scaled with `sips`; without
+  it (Linux) the source is copied unscaled into `mipmap-xxxhdpi` only and
+  the row says `:copied-unscaled`.
+  **Verified 2026-10-14** with icons from itonami's store art: `app
+  scaffold` + `app build --execute` for both; on a fresh iPhone 17 Pro Max
+  / iOS 26.5 Simulator the icon is on the Home screen, `UIDeviceFamily
+  [1]`, `PrivacyInfo.xcprivacy` and `Assets.car` in the bundle, no prompt,
+  content clear of the Dynamic Island and home indicator, `.well-known`
+  fetched, a scripted same-window link to example.com opened Safari; on an
+  API 35 `google_apis` Emulator (WebView 124) the adaptive icon in the
+  launcher and splash, `versionCode=42`, WebView bounds `[0,136][1080,2337]`
+  (between the bars), no prompt at launch with notify/show denied *and*
+  allowed, the prompt at the first `notify/show` → `posted: true`, Back
+  went page2 → index, was swallowed by a `preventDefault()`, then left to
+  the launcher, `mailto:` → Gmail `ComposeActivityGmailExternal`, https
+  and `target=_blank` → Chrome, `.well-known/…/receipts.json` and
+  `_app/x.json` fetched.
+  **Not verified:** a real App Store / Play upload or review; iPad
+  (`[:iphone :ipad]` was only inspected in `project.yml`; note
+  `UIRequiresFullScreen` is deprecated in iPadOS 26 and may stop being
+  honoured); `target=_blank` on iOS (a scripted click is popup-blocked, and
+  no one tapped it), `mailto:`/`tel:` on iOS (the Simulator has no Mail
+  app); Android below API 35 (insets/theme); the keyboard (IME) inset;
+  macOS gets none of the link handling; iOS still asks for notification
+  permission at launch when the policy allows `notify/show`; no
+  `UIScene` lifecycle (warned by the iOS 26 SDK); dark-themed apps get
+  white system-bar backgrounds on Android (no theme key yet). Unit tests:
+  `test/kotoba/shell/store_readiness_test.cljk` on the kbb engine (12
+  tests / 85 assertions, same command shape as below).
 - **Default CI is `kotoba compile` / guest-run, not `kbb -M`.** Job
   `kotoba-operator` in `.github/workflows/ci.yml` installs Release kotoba
   CLI, compiles `kotoba/launcher.kotoba` to wasm+web, checks files on disk,

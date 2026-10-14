@@ -1,0 +1,232 @@
+(ns kotoba.shell.store-readiness-test
+  "What `app scaffold` generates so an iOS / Android build can pass App Store
+  and Google Play review: icons, iPad and orientation, versions, privacy
+  manifest, edge-to-edge insets, the notification permission, system Back,
+  links that leave the bundle, dot-directories in assets.
+
+  Portable (no clojure.java.io) so it runs on the kbb engine:
+
+    kbb --backend sci --config nbb.edn --classpath src:resources:test \\
+        -e \"(require 'kotoba.shell.store-readiness-test)
+             (kotoba.shell.store-readiness-test/-main)\""
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing] :as t]
+            [kotoba.shell.host :as host]
+            [kotoba.shell.launcher :as launcher]))
+
+(def base
+  {:app/id "app.demo" :app/name "Demo" :app/version "1.2.3"
+   :ios/bundle-id "app.demo" :android/application-id "app.demo"})
+
+(def no-policy {:allow [] :deny []})
+
+(defn- files
+  ([target manifest] (files target manifest no-policy))
+  ([target manifest policy] (into {} (launcher/scaffold-files target manifest policy))))
+
+(defn- yml [manifest] (get (files :ios manifest) "project.yml"))
+
+(defn- u32 [n] [(bit-and (quot n 16777216) 255) (bit-and (quot n 65536) 255)
+                (bit-and (quot n 256) 255) (bit-and n 255)])
+
+(defn- chunk-bytes [type data]
+  (concat (u32 (count data)) (map #(.charCodeAt % 0) (map str type)) data [0 0 0 0]))
+
+(defn- png-bytes
+  "Header-only PNG: signature, IHDR, optional tRNS, empty IDAT, IEND. Enough
+  for the header inspection; not a decodable image."
+  [w h color-type & {:keys [trns?]}]
+  (concat [137 80 78 71 13 10 26 10]
+          (chunk-bytes "IHDR" (concat (u32 w) (u32 h) [8 color-type 0 0 0]))
+          (when trns? (chunk-bytes "tRNS" [0 0 0 0 0 0]))
+          (chunk-bytes "IDAT" [])
+          (chunk-bytes "IEND" [])))
+
+(defn- write-png! [dir name & args]
+  (let [f (host/file dir name)]
+    (host/write-file-bytes! f (apply png-bytes args))
+    name))
+
+(deftest png-header-inspection
+  (is (= {:width 1024 :height 1024 :color-type 2 :alpha? false}
+         (launcher/png-info (vec (png-bytes 1024 1024 2)))))
+  (is (:alpha? (launcher/png-info (vec (png-bytes 1024 1024 6))))
+      "an RGBA icon has an alpha channel even when every pixel is opaque")
+  (is (:alpha? (launcher/png-info (vec (png-bytes 1024 1024 2 :trns? true)))))
+  (is (nil? (launcher/png-info (vec (map int "not a png at all, just some text bytes"))))))
+
+(deftest ios-icon-validation
+  (let [dir (host/create-temp-dir "kotoba-icons")
+        ok (write-png! dir "ok.png" 1024 1024 2)
+        rgba (write-png! dir "rgba.png" 1024 1024 6)
+        small (write-png! dir "small.png" 512 512 2)
+        wide (write-png! dir "wide.png" 1024 512 2)
+        problem (fn [icon] (mapv :problem (launcher/icon-problems :ios (assoc base :ios/icon icon) dir)))]
+    (host/spit-file (host/file dir "text.png") "hello")
+    (is (= [] (problem ok)))
+    (is (= [:icon-has-alpha] (problem rgba)))
+    (is (= [:icon-wrong-size] (problem small)))
+    (is (= [:icon-not-square] (problem wide)))
+    (is (= [:icon-not-png] (problem "text.png")))
+    (is (= [:icon-file-missing] (problem "nope.png")))
+    (testing "absolute paths are taken as given"
+      (is (= [] (problem (.getPath (host/file dir ok))))))
+    (testing "scaffold refuses before writing anything"
+      (let [row (launcher/scaffold-target-row "target/never-written" (assoc base :ios/icon rgba)
+                                              no-policy :ios dir)]
+        (is (false? (:ok? row)))
+        (is (= :manifest-invalid (:reason row)))
+        (is (= [:ios/icon] (mapv :key (:invalid-manifest-keys row))))))))
+
+(deftest android-icon-validation
+  (let [dir (host/create-temp-dir "kotoba-icons")
+        fg (write-png! dir "fg.png" 432 432 6)
+        bg (write-png! dir "bg.png" 432 432 2)
+        tiny (write-png! dir "tiny.png" 100 100 6)
+        problems (fn [m] (mapv (juxt :key :problem) (launcher/icon-problems :android (merge base m) dir)))]
+    (is (= [] (problems {:android/icon fg :android/adaptive-icon {:foreground fg :background bg}}))
+        "alpha is fine on Android")
+    (is (= [] (problems {:android/adaptive-icon {:foreground fg :background "#1A2B3C"}}))
+        "a color background is not a file")
+    (is (= [[:android/icon :icon-too-small]] (problems {:android/icon tiny})))
+    (is (= [[[:android/adaptive-icon :foreground] :icon-too-small]]
+           (problems {:android/adaptive-icon {:foreground tiny :background bg}})))
+    (is (= [{:key :android/adaptive-icon :value {:foreground fg} :problem :needs-foreground-and-background}]
+           (launcher/invalid-manifest-keys :android (assoc base :android/adaptive-icon {:foreground fg}))))))
+
+(deftest icon-outputs
+  (testing "iOS: one single-size 1024 AppIcon"
+    (is (= [{:src "art/icon.png" :dest "Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png" :px nil}]
+           (launcher/icon-images :ios (assoc base :ios/icon "art/icon.png"))))
+    (let [f (files :ios (assoc base :ios/icon "art/icon.png"))]
+      (is (str/includes? (get f "Resources/Assets.xcassets/AppIcon.appiconset/Contents.json") "\"size\" : \"1024x1024\""))
+      (is (str/includes? (get f "project.yml") "ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon")))
+    (is (not (contains? (files :ios base) "Resources/Assets.xcassets/Contents.json"))))
+  (testing "Android: every density, launcher 48dp and adaptive layers 108dp"
+    (let [m (assoc base :android/icon "i.png" :android/adaptive-icon {:foreground "f.png" :background "#112233"})
+          px (into {} (map (juxt :dest :px)) (launcher/icon-images :android m))
+          f (files :android m)
+          manifest-xml (get f "app/src/main/AndroidManifest.xml")]
+      (is (= 48 (px "app/src/main/res/mipmap-mdpi/ic_launcher.png")))
+      (is (= 192 (px "app/src/main/res/mipmap-xxxhdpi/ic_launcher.png")))
+      (is (= 162 (px "app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png")))
+      (is (= 432 (px "app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png")))
+      (is (= 10 (count px)) "no background images for a color background")
+      (is (str/includes? (get f "app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml") "@color/ic_launcher_background"))
+      (is (str/includes? (get f "app/src/main/res/values/ic_launcher_background.xml") "#112233"))
+      (is (str/includes? manifest-xml "android:icon=\"@mipmap/ic_launcher\""))
+      (is (str/includes? manifest-xml "android:roundIcon=\"@mipmap/ic_launcher_round\""))
+      (is (= ["app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+              "app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png"]
+             (launcher/icon-check-paths :android m)))))
+  (testing "no icon declared: no icon attributes, a store warning instead"
+    (is (not (str/includes? (get (files :android base) "app/src/main/AndroidManifest.xml") "android:icon")))
+    (is (= [:android/icon-not-declared] (launcher/store-warnings :android base)))
+    (is (= [:ios/icon-not-declared] (launcher/store-warnings :ios base)))))
+
+(deftest ios-device-family-and-orientation
+  (testing "default: iPhone only, portrait, no iPad keys"
+    (let [y (yml base)]
+      (is (str/includes? y "TARGETED_DEVICE_FAMILY: \"1\""))
+      (is (str/includes? y "- UIInterfaceOrientationPortrait"))
+      (is (not (str/includes? y "~ipad")))
+      (is (not (str/includes? y "UIRequiresFullScreen")))))
+  (testing "iPad without every orientation must opt out of multitasking"
+    (let [y (yml (assoc base :ios/device-family [:iphone :ipad]))]
+      (is (str/includes? y "TARGETED_DEVICE_FAMILY: \"1,2\""))
+      (is (str/includes? y "\"UISupportedInterfaceOrientations~ipad\":"))
+      (is (str/includes? y "UIRequiresFullScreen: true"))))
+  (testing "iPad with all four orientations multitasks"
+    (let [y (yml (assoc base :ios/device-family [:iphone :ipad]
+                        :ios/orientations [:portrait :portrait-upside-down :landscape-left :landscape-right]))]
+      (is (str/includes? y "- UIInterfaceOrientationLandscapeLeft"))
+      (is (not (str/includes? y "UIRequiresFullScreen")))))
+  (testing "unknown values are refused"
+    (is (= [:ios/device-family :ios/orientations :ios/build-number]
+           (mapv :key (launcher/invalid-manifest-keys
+                       :ios (assoc base :ios/device-family [:watch] :ios/orientations [:sideways]
+                                   :ios/build-number "1.x")))))))
+
+(deftest versions-and-plist-keys
+  (let [y (yml (assoc base :ios/build-number 7))]
+    (is (str/includes? y "CFBundleVersion: \"7\""))
+    (is (str/includes? y "CURRENT_PROJECT_VERSION: \"7\""))
+    (is (str/includes? y "ITSAppUsesNonExemptEncryption: false"))
+    (is (str/includes? y "LSRequiresIPhoneOS: true")))
+  (is (str/includes? (yml base) "CFBundleVersion: \"1\""))
+  (is (str/includes? (get (files :android (assoc base :android/version-code 42)) "app/build.gradle") "versionCode 42"))
+  (is (= [:android/version-code]
+         (mapv :key (launcher/invalid-manifest-keys :android (assoc base :android/version-code 0))))))
+
+(deftest ios-privacy-manifest
+  (let [p (get (files :ios base) "Resources/PrivacyInfo.xcprivacy")]
+    (is (str/includes? p "<key>NSPrivacyTracking</key>\n\t<false/>"))
+    (is (str/includes? p "<key>NSPrivacyAccessedAPITypes</key>\n\t<array/>")))
+  (is (str/includes? (get (files :ios (assoc base :ios/privacy-accessed-api-types
+                                             [{:type "NSPrivacyAccessedAPICategoryUserDefaults" :reasons ["CA92.1"]}]))
+                          "Resources/PrivacyInfo.xcprivacy")
+                     "<string>CA92.1</string>")))
+
+(deftest android-manifest-defaults
+  (let [m (get (files :android base) "app/src/main/AndroidManifest.xml")]
+    (is (str/includes? m "android:theme=\"@style/KotobaShellTheme\""))
+    (is (str/includes? m "android:allowBackup=\"false\""))
+    (is (str/includes? m "android:usesCleartextTraffic=\"false\""))
+    (is (str/includes? m "android:enableOnBackInvokedCallback=\"true\"")))
+  (let [m (get (files :android (assoc base :android/allow-backup? true :android/cleartext-traffic? true))
+               "app/src/main/AndroidManifest.xml")]
+    (is (str/includes? m "android:allowBackup=\"true\""))
+    (is (str/includes? m "android:usesCleartextTraffic=\"true\"")))
+  (is (str/includes? (get (files :android base) "app/src/main/res/values/themes.xml") "NoActionBar")))
+
+(deftest notification-permission-follows-the-policy
+  (let [main "app/src/main/java/app/demo/MainActivity.java"
+        denied (files :android base no-policy)
+        allowed (files :android base {:allow ["notify/show"] :deny []})]
+    (is (not (str/includes? (get denied "app/src/main/AndroidManifest.xml") "POST_NOTIFICATIONS")))
+    (is (str/includes? (get allowed "app/src/main/AndroidManifest.xml") "POST_NOTIFICATIONS"))
+    (is (not (str/includes? (get (files :android base {:allow ["*"] :deny ["notify/show"]})
+                                 "app/src/main/AndroidManifest.xml") "POST_NOTIFICATIONS")))
+    (testing "asked at first use, never at launch"
+      (is (not (str/includes? (get allowed main) "requestPermissions")))
+      (is (str/includes? (get allowed main) "bridge.onRequestPermissionsResult(requestCode)"))
+      (is (str/includes? (get allowed "app/src/main/java/app/demo/KotobaShellBridge.java")
+                         "ensureNotificationPermission();")))))
+
+(deftest android-main-activity
+  (let [main (get (files :android base) "app/src/main/java/app/demo/MainActivity.java")]
+    (testing "edge-to-edge insets"
+      (is (str/includes? main "setOnApplyWindowInsetsListener"))
+      (is (str/includes? main "WindowInsets.Type.systemBars()"))
+      (is (str/includes? main "WindowInsets.Type.ime()"))
+      (is (str/includes? main "setContentView(root)")))
+    (testing "Back: page event, then history, then leave"
+      (is (str/includes? main "kotobaShell:back"))
+      (is (str/includes? main "view.canGoBack()"))
+      (is (str/includes? main "registerOnBackInvokedCallback"))
+      (is (str/includes? main "public void onBackPressed()")))
+    (testing "links that leave the bundle"
+      (is (str/includes? main "shouldOverrideUrlLoading"))
+      (is (str/includes? main "\"appassets.androidplatform.net\".equals(uri.getHost())"))
+      (is (str/includes? main "Intent.ACTION_SENDTO")))))
+
+(deftest android-assets-keep-dot-directories
+  (let [g (get (files :android base) "app/build.gradle")]
+    (is (str/includes? g "ignoreAssetsPattern = '!.svn:!.git:"))
+    (is (not (re-find #"ignoreAssetsPattern = '[^']*:\.\*" g)))))
+
+(deftest ios-external-navigation
+  (let [f (files :ios base)]
+    (is (str/includes? (get f "Sources/ExternalNavigationPolicy.swift") "\"mailto\""))
+    (is (str/includes? (get f "Sources/ExternalNavigationPolicy.swift") "UIApplication.shared.open"))
+    (is (str/includes? (get f "Sources/AppDelegate.swift") "webView.navigationDelegate = navigationPolicy"))))
+
+#?(:cljs
+   (defmethod t/report [:cljs.test/default :end-run-tests] [m]
+     (when-not (t/successful? m)
+       (set! (.-exitCode js/process) 1))))
+
+(defn -main [& _]
+  (let [summary (t/run-tests 'kotoba.shell.store-readiness-test)]
+    #?(:clj (System/exit (if (t/successful? summary) 0 1))
+       :cljs summary)))

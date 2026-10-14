@@ -27,6 +27,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.util.Base64;
 import android.webkit.JavascriptInterface;
@@ -52,6 +53,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -625,14 +627,76 @@ public final class KotobaShellBridge {
         return object("status", status, "headers", responseHeaders, "body", text);
     }
 
+    // ---- notify/show permission ------------------------------------------
+    //
+    // POST_NOTIFICATIONS (API 33+) is asked for here, at the first
+    // notify/show, and not at launch: the scaffold declares the permission
+    // only when the policy allows notify/show, and an app should not open
+    // with a permission sheet for a feature the person has not reached. The
+    // call waits for the answer, so its result reflects the decision rather
+    // than how fast someone tapped. Bounded, in case the Activity goes away
+    // with the sheet still up and no answer ever arrives.
+
+    public static final int NOTIFICATION_PERMISSION_REQUEST = 0x6b73;
+    private static final String POST_NOTIFICATIONS = "android.permission.POST_NOTIFICATIONS";
+    private static final long NOTIFICATION_PERMISSION_WAIT_SECONDS = 300;
+    private final Object notificationPermissionLock = new Object();
+    private CountDownLatch notificationPermissionAnswer;
+
+    /** Forwarded from the Activity's onRequestPermissionsResult. */
+    public void onRequestPermissionsResult(int requestCode) {
+        if (requestCode != NOTIFICATION_PERMISSION_REQUEST) {
+            return;
+        }
+        CountDownLatch answered;
+        synchronized (notificationPermissionLock) {
+            answered = notificationPermissionAnswer;
+            notificationPermissionAnswer = null;
+        }
+        if (answered != null) {
+            answered.countDown();
+        }
+    }
+
+    private void ensureNotificationPermission() throws InterruptedException {
+        if (Build.VERSION.SDK_INT < 33
+                || activity.checkSelfPermission(POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        CountDownLatch answer;
+        boolean ask = false;
+        synchronized (notificationPermissionLock) {
+            if (notificationPermissionAnswer == null) {
+                notificationPermissionAnswer = new CountDownLatch(1);
+                ask = true;
+            }
+            answer = notificationPermissionAnswer;
+        }
+        if (ask) {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    activity.requestPermissions(new String[]{POST_NOTIFICATIONS},
+                            NOTIFICATION_PERMISSION_REQUEST);
+                }
+            });
+        }
+        answer.await(NOTIFICATION_PERMISSION_WAIT_SECONDS, TimeUnit.SECONDS);
+    }
+
     private JSONObject notify(String title, String body) throws Exception {
+        ensureNotificationPermission();
         NotificationManager manager =
                 (NotificationManager) activity.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager == null) {
             throw new IllegalStateException("no notification manager");
         }
         NotificationChannel channel = new NotificationChannel(
-                NOTIFICATION_CHANNEL, "Kotoba Shell", NotificationManager.IMPORTANCE_DEFAULT);
+                // The channel name is shown in system Settings: the app's
+                // own label, not this shell's name.
+                NOTIFICATION_CHANNEL,
+                String.valueOf(activity.getApplicationInfo().loadLabel(activity.getPackageManager())),
+                NotificationManager.IMPORTANCE_DEFAULT);
         manager.createNotificationChannel(channel);
         Notification.Builder builder = new Notification.Builder(activity, NOTIFICATION_CHANNEL)
                 .setContentTitle(title)
