@@ -9,15 +9,17 @@
 // Injected before any page script runs:
 //   - Apple: WKUserScript at .atDocumentStart
 //   - Android: WebViewCompat.addDocumentStartJavaScript, falling back to
-//     onPageStarted when the WebView provider is too old for that feature.
+//     onPageStarted on the bundled app origin when the provider is too old.
 //
 // The two platforms differ only in transport. Apple's
 // WKScriptMessageHandlerWithReply already returns a promise from
-// postMessage; Android's @JavascriptInterface is synchronous-only and must
-// not block, so the native side takes a request id and calls back into
-// __kotobaShellDeliver. Callers see one API either way.
+// postMessage. Android's origin-restricted WebMessageListener uses a request
+// id and replies to the originating frame. Callers see one API either way.
 (function () {
   "use strict";
+  // Android injects origin-scoped scripts into matching frames. The native
+  // listener also rejects subframes; do not expose a facade that would hang.
+  if (window.top !== window) { return; }
   if (window.kotobaShell) { return; }
 
   var SCHEMA = "kotoba.shell.bridge.v0";
@@ -62,7 +64,11 @@
     return new Promise(function (resolve) {
       pending[id] = { resolve: resolve };
       try {
-        window.KotobaShellNative.request(id, command, JSON.stringify(args || {}));
+        window.KotobaShellNative.postMessage(JSON.stringify({
+          id: id,
+          command: command,
+          args: args || {}
+        }));
       } catch (err) {
         delete pending[id];
         resolve({ schema: SCHEMA, command: command, ok: false, error: "bridge-error", detail: String(err) });
@@ -70,19 +76,31 @@
     });
   }
 
+  function installAndroidReplyHandler(nativeBridge) {
+    nativeBridge.onmessage = function (event) {
+      try {
+        var response = JSON.parse(event.data);
+        if (!response || typeof response.id !== "string" || !response.payload) { return; }
+        window.__kotobaShellDeliver(response.id, JSON.stringify(response.payload));
+      } catch (_) {
+        // Ignore malformed native replies; the bridge contract never rejects.
+      }
+    };
+  }
+
   var transport = null;
   if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.kotobaShell) {
     transport = appleInvoke;
-  } else if (window.KotobaShellNative && window.KotobaShellNative.request) {
+  } else if (window.KotobaShellNative && typeof window.KotobaShellNative.postMessage === "function") {
+    installAndroidReplyHandler(window.KotobaShellNative);
     transport = androidInvoke;
   }
 
   window.kotobaShell = {
     schema: SCHEMA,
     available: transport !== null,
-    // Substituted at scaffold time. Not read back off the native object:
-    // addJavascriptInterface exposes annotated *methods* only, so a property
-    // read there would silently be undefined.
+    // Substituted at scaffold time instead of read back from the native
+    // transport, which intentionally exposes only message delivery.
     target: "{{TARGET}}",
 
     // invoke(command, args) -> Promise<{ok, value, audit, ...}>

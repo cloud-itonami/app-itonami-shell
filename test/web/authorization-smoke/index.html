@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>kotoba-shell authorization smoke</title>
+  </head>
+  <body style="font:13px ui-monospace,monospace;margin:0;padding:12px;padding-top:60px;background:#111;color:#eee">
+    <pre id="out">running…</pre>
+    <script>
+      // Exercises auth/open-authorization-url end to end in a scaffolded app
+      // whose manifest declares the scheme below and whose policy allows the
+      // command plus fs/write-text (to leave the report where the host can
+      // read it back).
+      //
+      // The refusals come first, because a bridge that opened every URL
+      // would pass the happy path just as well. The real round-trip uses a
+      // public 302 to the app's scheme -- no IdP, no credentials: what is
+      // under test is that the system browser runs and the redirect comes
+      // back to this page, not OAuth itself. The last step opens a page that
+      // never redirects and waits for a person (or `adb shell input keyevent
+      // BACK`, or a tap on Cancel) to abandon it.
+      var SCHEME = "dev.kotoba.authsmoke";
+      var REDIRECT = "https://httpbin.org/redirect-to?status_code=302&url=" +
+        encodeURIComponent(SCHEME + "://callback?code=smoke&state=xyz");
+
+      (async function () {
+        var results = [];
+        var out = document.getElementById("out");
+
+        function record(step, reply) {
+          results.push({
+            step: step,
+            ok: reply.ok === true,
+            error: reply.error || null,
+            value: reply.value || null,
+            matchedAllow: reply.audit ? reply.audit["audit/matched-allow"] : null
+          });
+        }
+
+        async function report(phase) {
+          var body = {
+            schema: "kotoba.shell.authorization-smoke.v0",
+            phase: phase,
+            target: window.kotobaShell ? window.kotobaShell.target : null,
+            available: !!(window.kotobaShell && window.kotobaShell.available),
+            results: results
+          };
+          out.textContent = JSON.stringify(body, null, 2);
+          console.log("KOTOBA_SHELL_AUTH_SMOKE " + JSON.stringify(body));
+          if (body.available) {
+            await window.kotobaShell.invoke("fs/write-text", {
+              path: "authorization-smoke.json", text: JSON.stringify(body)
+            });
+          }
+        }
+
+        function open(url, scheme) {
+          return window.kotobaShell.invoke("auth/open-authorization-url",
+                                           { url: url, callbackScheme: scheme });
+        }
+
+        if (!(window.kotobaShell && window.kotobaShell.available)) {
+          await report("unavailable");
+          return;
+        }
+
+        // Must be refused: the page names a scheme the manifest did not declare.
+        record("scheme-mismatch", await open(REDIRECT, "com.someone.else"));
+        // Must be refused: not https.
+        record("invalid-url", await open("http://example.com/", SCHEME));
+
+        // A real round-trip, with a second request fired while it is open.
+        var first = open(REDIRECT, SCHEME);
+        record("busy", await open(REDIRECT, SCHEME));
+        record("round-trip", await first);
+        await report("round-trip");
+
+        // Let the first sheet / tab finish dismissing before presenting again.
+        await new Promise(function (r) { setTimeout(r, 1500); });
+        // Abandoned by the user -> cancelled.
+        record("cancel", await open("https://example.com/", SCHEME));
+        await report("done");
+      })();
+    </script>
+  </body>
+</html>

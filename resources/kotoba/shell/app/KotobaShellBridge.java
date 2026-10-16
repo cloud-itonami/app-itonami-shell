@@ -7,17 +7,17 @@ package {{PACKAGE}};
 // to an attached device; a distributed .apk has no adb. These providers are
 // compiled into the app.
 //
-// @JavascriptInterface methods run on a private binder thread and must not
-// block, so `request` hands the work to an executor and the result comes back
-// through evaluateJavascript into __kotobaShellDeliver. Apple's
-// WKScriptMessageHandlerWithReply returns a promise directly; the JS shim
-// hides that difference.
+// WebMessageListener provides the caller's origin and a reply proxy scoped to
+// that frame. Requests are handed to an executor; the JS shim hides the
+// transport difference from Apple's WKScriptMessageHandlerWithReply.
 //
 // The policy decision below matches kotoba.shell.launcher/policy-decision and
 // KotobaShellBridge.swift clause for clause. A missing policy asset denies
 // everything.
 
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
+import android.net.Uri;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Notification;
@@ -27,8 +27,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.util.Base64;
-import android.webkit.JavascriptInterface;
-import android.webkit.WebView;
+import androidx.webkit.JavaScriptReplyProxy;
 
 import org.json.JSONObject;
 
@@ -37,6 +36,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -47,6 +47,7 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -66,22 +67,54 @@ public final class KotobaShellBridge {
     private static final String KEYCHAIN_PREFS = "{{KEYCHAIN_PREFS}}";
     private static final String DATA_DIR = "{{DATA_DIR}}";
     private static final String NOTIFICATION_CHANNEL = "kotoba-shell";
+    public static final String AUTHORIZATION_COMMAND = "auth/open-authorization-url";
+    /**
+     * The redirect scheme, from :android/oauth-callback-scheme -- never from
+     * the page. Empty means not configured; the command then refuses rather
+     * than waiting on a redirect no intent-filter would deliver.
+     */
+    public static final String OAUTH_CALLBACK_SCHEME = "{{OAUTH_CALLBACK_SCHEME}}";
+
+    /**
+     * Opens an authorization URL outside the WebView. Implemented by the
+     * generated KotobaShellAuthCallbackActivity.CustomTabsLauncher, which
+     * exists (with its androidx.browser dependency) only when the manifest
+     * declares a scheme -- so this file compiles either way.
+     */
+    public interface AuthorizationLauncher {
+        void launch(Activity activity, Uri uri);
+    }
+
+    // The redirect arrives in a different Activity than the one that owns the
+    // WebView, so the receiving side finds the bridge through this. Weak: the
+    // bridge must not outlive its Activity because a sign-in was pending.
+    private static volatile WeakReference<KotobaShellBridge> active = new WeakReference<>(null);
 
     private final Activity activity;
-    private final WebView webView;
     private final Set<String> allow = new HashSet<>();
     private final Set<String> deny = new HashSet<>();
     private final JSONObject capabilities;
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
+    private final ConcurrentHashMap<String, JavaScriptReplyProxy> pendingReplies = new ConcurrentHashMap<>();
+    private AuthorizationLauncher authorizationLauncher;
+    // One sign-in at a time: the request id waiting for a redirect, and
+    // whether the browser has actually been launched for it (only then does
+    // returning to the app without a redirect mean "cancelled").
+    private String pendingAuthorizationId;
+    private boolean authorizationLaunched;
 
-    public KotobaShellBridge(Activity activity, WebView webView, JSONObject policy) {
+    public KotobaShellBridge(Activity activity, JSONObject policy) {
         this.activity = activity;
-        this.webView = webView;
         this.capabilities = policy.optJSONObject("capabilities") != null
                 ? policy.optJSONObject("capabilities")
                 : new JSONObject();
         readTokens(policy, "allow", allow);
         readTokens(policy, "deny", deny);
+        active = new WeakReference<>(this);
+    }
+
+    public void setAuthorizationLauncher(AuthorizationLauncher launcher) {
+        this.authorizationLauncher = launcher;
     }
 
     private static void readTokens(JSONObject policy, String key, Set<String> into) {
@@ -130,23 +163,45 @@ public final class KotobaShellBridge {
 
     // ---- transport -------------------------------------------------------
 
-    @JavascriptInterface
-    public void request(final String id, final String command, final String argsJson) {
+    public void request(final String requestJson, final JavaScriptReplyProxy replyProxy) {
         executor.execute(new Runnable() {
             @Override
             public void run() {
-                JSONObject args;
+                JSONObject request;
                 try {
-                    args = argsJson == null || argsJson.isEmpty()
-                            ? new JSONObject()
-                            : new JSONObject(argsJson);
+                    request = new JSONObject(requestJson);
                 } catch (Exception e) {
-                    deliver(id, envelope(command, false, null, "malformed-args", denial(command)));
+                    postResponse(replyProxy, "", envelope("", false, null, "malformed-request", denial("")));
+                    return;
+                }
+                String id = request.optString("id", "");
+                String command = request.optString("command", "");
+                Object rawArgs = request.opt("args");
+                JSONObject args;
+                if (rawArgs == null || rawArgs == JSONObject.NULL) {
+                    args = new JSONObject();
+                } else if (rawArgs instanceof JSONObject) {
+                    args = (JSONObject) rawArgs;
+                } else {
+                    postResponse(replyProxy, id, envelope(command, false, null, "malformed-args", denial(command)));
+                    return;
+                }
+                if (id.isEmpty() || command.isEmpty()) {
+                    postResponse(replyProxy, id, envelope(command, false, null, "malformed-request", denial(command)));
+                    return;
+                }
+                if (pendingReplies.putIfAbsent(id, replyProxy) != null) {
+                    postResponse(replyProxy, id, envelope(command, false, null, "duplicate-request-id", denial(command)));
                     return;
                 }
                 JSONObject verdict = denial(command);
                 if (!verdict.optBoolean("allowed", false)) {
                     deliver(id, envelope(command, false, null, "policy-denied", verdict));
+                    return;
+                }
+                if (AUTHORIZATION_COMMAND.equals(command)) {
+                    // Resolves later, from the redirect or from onHostResume.
+                    openAuthorization(id, args, verdict);
                     return;
                 }
                 try {
@@ -160,14 +215,139 @@ public final class KotobaShellBridge {
     }
 
     private void deliver(final String id, final JSONObject payload) {
-        final String script = "window.__kotobaShellDeliver("
-                + JSONObject.quote(id) + "," + JSONObject.quote(payload.toString()) + ")";
-        webView.post(new Runnable() {
+        final JavaScriptReplyProxy replyProxy = pendingReplies.remove(id);
+        if (replyProxy != null) {
+            postResponse(replyProxy, id, payload);
+        }
+    }
+
+    private void postResponse(final JavaScriptReplyProxy replyProxy, final String id, final JSONObject payload) {
+        activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                webView.evaluateJavascript(script, null);
+                JSONObject response = new JSONObject();
+                try {
+                    response.put("id", id);
+                    response.put("payload", payload);
+                    replyProxy.postMessage(response.toString());
+                } catch (Exception ignored) {
+                    // JSONObject only rejects null keys; the bridge uses fixed keys.
+                }
             }
         });
+    }
+
+    // ---- auth/open-authorization-url -------------------------------------
+    //
+    // OAuth must not run in this WebView (RFC 8252 section 8.12): the app
+    // could read what is typed into a page it hosts, and Google refuses
+    // embedded user agents (disallowed_useragent). Custom Tabs runs the page
+    // in the browser's process; the redirect to the declared scheme comes
+    // back through KotobaShellAuthCallbackActivity's intent-filter.
+    //
+    // The bridge decides nothing about OAuth itself -- state, PKCE, DPoP and
+    // the token exchange stay in the page.
+
+    private void openAuthorization(final String id, JSONObject args, final JSONObject verdict) {
+        if (OAUTH_CALLBACK_SCHEME.isEmpty() || authorizationLauncher == null) {
+            deliver(id, envelope(AUTHORIZATION_COMMAND, false, null, "scheme-not-configured", verdict));
+            return;
+        }
+        String requested = args.optString("callbackScheme", "");
+        if (!OAUTH_CALLBACK_SCHEME.equalsIgnoreCase(requested)) {
+            deliver(id, envelope(AUTHORIZATION_COMMAND, false, null, "scheme-mismatch", verdict));
+            return;
+        }
+        // https only: otherwise any injected script could use the bridge to
+        // launch arbitrary intents/URLs outside the app.
+        final Uri uri = Uri.parse(args.optString("url", ""));
+        if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null) {
+            deliver(id, envelope(AUTHORIZATION_COMMAND, false, null, "invalid-url", verdict));
+            return;
+        }
+        synchronized (this) {
+            if (pendingAuthorizationId != null) {
+                deliver(id, envelope(AUTHORIZATION_COMMAND, false, null, "busy", verdict));
+                return;
+            }
+            pendingAuthorizationId = id;
+            authorizationLaunched = false;
+        }
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                synchronized (KotobaShellBridge.this) {
+                    authorizationLaunched = true;
+                }
+                String failure = null;
+                try {
+                    authorizationLauncher.launch(activity, uri);
+                } catch (ActivityNotFoundException e) {
+                    failure = "no-browser";
+                } catch (RuntimeException e) {
+                    failure = "start-failed";
+                }
+                if (failure != null) {
+                    String pending = takePendingAuthorization();
+                    if (pending != null) {
+                        deliver(pending, envelope(AUTHORIZATION_COMMAND, false, null, failure, denial(AUTHORIZATION_COMMAND)));
+                    }
+                }
+            }
+        });
+    }
+
+    private synchronized String takePendingAuthorization() {
+        String pending = pendingAuthorizationId;
+        pendingAuthorizationId = null;
+        authorizationLaunched = false;
+        return pending;
+    }
+
+    /**
+     * Called by KotobaShellAuthCallbackActivity with the redirect it
+     * received. Returns false when nothing was waiting -- a redirect that
+     * arrives unasked (another app firing our scheme, or a sign-in whose
+     * Activity was destroyed meanwhile) is dropped, not delivered to
+     * whatever page happens to be loaded.
+     */
+    public static boolean deliverAuthorizationCallback(Uri uri) {
+        KotobaShellBridge bridge = active.get();
+        if (bridge == null || uri == null || !OAUTH_CALLBACK_SCHEME.equalsIgnoreCase(uri.getScheme())) {
+            return false;
+        }
+        String pending = bridge.takePendingAuthorization();
+        if (pending == null) {
+            return false;
+        }
+        try {
+            bridge.deliver(pending, bridge.envelope(AUTHORIZATION_COMMAND, true,
+                    object("callbackURL", uri.toString()), null, bridge.denial(AUTHORIZATION_COMMAND)));
+        } catch (Exception e) {
+            bridge.deliver(pending, bridge.envelope(AUTHORIZATION_COMMAND, false, null,
+                    String.valueOf(e.getMessage()), bridge.denial(AUTHORIZATION_COMMAND)));
+        }
+        return true;
+    }
+
+    /**
+     * Called from MainActivity.onResume. Custom Tabs has no "closed"
+     * callback, so the only sign of cancellation is the app coming back to
+     * the foreground with the browser launched and no redirect delivered.
+     * The redirect, when there is one, is handled in the callback Activity's
+     * onCreate, which runs before MainActivity resumes.
+     */
+    public void onHostResume() {
+        String pending;
+        synchronized (this) {
+            if (pendingAuthorizationId == null || !authorizationLaunched) {
+                return;
+            }
+            pending = pendingAuthorizationId;
+            pendingAuthorizationId = null;
+            authorizationLaunched = false;
+        }
+        deliver(pending, envelope(AUTHORIZATION_COMMAND, false, null, "cancelled", denial(AUTHORIZATION_COMMAND)));
     }
 
     // ---- policy ----------------------------------------------------------

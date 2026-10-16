@@ -573,6 +573,16 @@
   (vec (remove #(contains? manifest %)
                (get-in release-target-specs [target :required-manifest-keys]))))
 
+(defn invalid-manifest-keys
+  "Manifest values present but unusable for `target`, as
+  `[{:key k :value v :problem kw}]`. Checked before scaffolding because
+  these values are substituted into Swift, Java and AndroidManifest.xml."
+  [target manifest]
+  (let [k (get bridge/oauth-callback-scheme-keys target)
+        scheme (bridge/oauth-callback-scheme target manifest)]
+    (vec (when-let [problem (and k (bridge/oauth-callback-scheme-problem scheme))]
+           [{:key k :value scheme :problem problem}]))))
+
 (defn sanitize-path-part
   [value]
   (str/replace (str value) #"[^A-Za-z0-9._-]" "-"))
@@ -883,7 +893,13 @@
                          ;; them keeps the link explicit for anyone reading
                          ;; the generated project.
                          "UserNotifications.framework"
-                         "Security.framework"]
+                         "Security.framework"
+                         ;; auth/open-authorization-url
+                         ;; (ASWebAuthenticationSession) lives in the
+                         ;; bridge, so it links whether or not a scheme is
+                         ;; declared; an undeclared scheme refuses at run
+                         ;; time instead.
+                         "AuthenticationServices.framework"]
                         (when (and (= target :macos)
                                    (= :keychain-cacao (:macos/auth-bridge manifest)))
                           ["LocalAuthentication.framework"
@@ -1092,10 +1108,22 @@
        "import android.webkit.WebView;\n"
        "import android.webkit.WebViewClient;\n\n"
        "import androidx.webkit.WebViewAssetLoader;\n"
+       "import androidx.webkit.JavaScriptReplyProxy;\n"
+       "import androidx.webkit.WebMessageCompat;\n"
        "import androidx.webkit.WebViewCompat;\n"
        "import androidx.webkit.WebViewFeature;\n\n"
        "import java.util.Collections;\n\n"
        "public class MainActivity extends Activity {\n"
+       ;; A field, not a local: onResume needs it to notice a sign-in the
+       ;; user abandoned (Custom Tabs has no "closed" callback).
+       "    private KotobaShellBridge bridge;\n\n"
+       "    @Override\n"
+       "    protected void onResume() {\n"
+       "        super.onResume();\n"
+       "        if (bridge != null) {\n"
+       "            bridge.onHostResume();\n"
+       "        }\n"
+       "    }\n\n"
        "    @Override\n"
        "    protected void onCreate(Bundle savedInstanceState) {\n"
        "        super.onCreate(savedInstanceState);\n"
@@ -1106,9 +1134,37 @@
        "        final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()\n"
        "                .addPathHandler(\"/assets/\", new WebViewAssetLoader.AssetsPathHandler(this))\n"
        "                .build();\n"
-       "        KotobaShellBridge bridge =\n"
-       "                new KotobaShellBridge(this, webView, KotobaShellBridge.loadPolicy(this));\n"
-       "        webView.addJavascriptInterface(bridge, KotobaShellBridge.INTERFACE_NAME);\n"
+       "        bridge = new KotobaShellBridge(this, KotobaShellBridge.loadPolicy(this));\n"
+       (when (bridge/oauth-callback-scheme :android manifest)
+         "        bridge.setAuthorizationLauncher(new KotobaShellAuthCallbackActivity.CustomTabsLauncher());\n")
+       ;; Fail closed on WebView providers without the origin-aware message API.
+       ;; addJavascriptInterface cannot identify which frame or origin called it.
+       "        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {\n"
+       "            WebViewCompat.addWebMessageListener(webView, KotobaShellBridge.INTERFACE_NAME,\n"
+       "                    Collections.singleton(\"" android-app-origin "\"),\n"
+       "                    new WebViewCompat.WebMessageListener() {\n"
+       "                        @Override\n"
+       "                        public void onPostMessage(WebView view, WebMessageCompat message,\n"
+       "                                                  android.net.Uri sourceOrigin, boolean isMainFrame,\n"
+       "                                                  JavaScriptReplyProxy replyProxy) {\n"
+       "                            String pageUrl = view.getUrl();\n"
+       "                            if (!isMainFrame || pageUrl == null || sourceOrigin == null\n"
+       "                                    || !\"https\".equalsIgnoreCase(sourceOrigin.getScheme())\n"
+       "                                    || !\"appassets.androidplatform.net\".equalsIgnoreCase(sourceOrigin.getHost())) {\n"
+       "                                return;\n"
+       "                            }\n"
+       "                            android.net.Uri page = android.net.Uri.parse(pageUrl);\n"
+       "                            String path = page.getPath();\n"
+       "                            if (!\"https\".equalsIgnoreCase(page.getScheme())\n"
+       "                                    || !\"appassets.androidplatform.net\".equalsIgnoreCase(page.getHost())\n"
+       "                                    || (page.getPort() != -1 && page.getPort() != 443)\n"
+       "                                    || path == null || !path.startsWith(\"/assets/\")) {\n"
+       "                                return;\n"
+       "                            }\n"
+       "                            bridge.request(message.getData(), replyProxy);\n"
+       "                        }\n"
+       "                    });\n"
+       "        }\n"
        "        final String shim = KotobaShellBridge.shimSource(this);\n"
        ;; Document-start injection is the only placement that guarantees the
        ;; shim exists before the page's own scripts. Where the installed
@@ -1128,7 +1184,13 @@
        "            }\n\n"
        "            @Override\n"
        "            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {\n"
-       "                if (!documentStart && shim != null) {\n"
+       "                android.net.Uri page = android.net.Uri.parse(url);\n"
+       "                String path = page.getPath();\n"
+       "                if (!documentStart && shim != null\n"
+       "                        && \"https\".equalsIgnoreCase(page.getScheme())\n"
+       "                        && \"appassets.androidplatform.net\".equalsIgnoreCase(page.getHost())\n"
+       "                        && (page.getPort() == -1 || page.getPort() == 443)\n"
+       "                        && path != null && path.startsWith(\"/assets/\")) {\n"
        "                    view.evaluateJavascript(shim, null);\n"
        "                }\n"
        "            }\n"
@@ -1174,8 +1236,18 @@
                                   [command capability])))
                         bridge/bridge-provider-commands)}))
 
+(declare ^:private scaffold-files*)
+
 (defn scaffold-files
+  "`[[relative-path body] ...]` for `target`. Entries that only exist under
+  a manifest declaration (the Android OAuth redirect receiver) are nil in
+  `scaffold-files*` and dropped here."
   [target manifest policy]
+  (let [android-oauth-scheme (bridge/oauth-callback-scheme :android manifest)]
+    (vec (remove nil? (scaffold-files* target manifest policy android-oauth-scheme)))))
+
+(defn- scaffold-files*
+  [target manifest policy android-oauth-scheme]
   (case target
     :macos [["project.yml" (xcodegen-project-yml target manifest)]
             ["Sources/main.swift" macos-main-swift]
@@ -1263,6 +1335,11 @@
                     ;; 前に bridge を注入する唯一の確実な位置)のために要る。
                     "dependencies {\n"
                     "    implementation 'androidx.webkit:webkit:1.12.1'\n"
+                    ;; Custom Tabs for auth/open-authorization-url — only
+                    ;; when a callback scheme is declared, since nothing
+                    ;; else uses it.
+                    (when android-oauth-scheme
+                      "    implementation 'androidx.browser:browser:1.8.0'\n")
                     "}\n")]
               ;; androidx.webkit pulls in AndroidX, which AGP refuses to
               ;; resolve unless the project opts in — the build fails at
@@ -1276,6 +1353,16 @@
                (str "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n"
                     "  <uses-permission android:name=\"android.permission.INTERNET\" />\n"
                     "  <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />\n"
+                    ;; Android 11+ package visibility hides Custom Tabs
+                    ;; providers unless the app declares it looks for them;
+                    ;; without this CustomTabsClient.getPackageName is always
+                    ;; null and every sign-in falls back to a plain browser.
+                    (when android-oauth-scheme
+                      (str "  <queries>\n"
+                           "    <intent>\n"
+                           "      <action android:name=\"android.support.customtabs.action.CustomTabsService\" />\n"
+                           "    </intent>\n"
+                           "  </queries>\n"))
                     "  <application android:label=\"" (xml-escape (:app/name manifest)) "\" android:usesCleartextTraffic=\"true\">\n"
                     "    <activity android:name=\".MainActivity\" android:exported=\"true\">\n"
                     "      <intent-filter>\n"
@@ -1283,12 +1370,34 @@
                     "        <category android:name=\"android.intent.category.LAUNCHER\" />\n"
                     "      </intent-filter>\n"
                     "    </activity>\n"
+                    ;; The redirect receiver for auth/open-authorization-url.
+                    ;; Exported (a browser has to be able to start it) and
+                    ;; therefore only present when a scheme is declared;
+                    ;; the scheme is the manifest's, validated by
+                    ;; native-bridge/oauth-callback-scheme-problem, never the
+                    ;; page's.
+                    (when android-oauth-scheme
+                      (str "    <activity android:name=\".KotobaShellAuthCallbackActivity\"\n"
+                           "              android:exported=\"true\"\n"
+                           "              android:excludeFromRecents=\"true\"\n"
+                           "              android:noHistory=\"true\"\n"
+                           "              android:theme=\"@android:style/Theme.Translucent.NoTitleBar\">\n"
+                           "      <intent-filter>\n"
+                           "        <action android:name=\"android.intent.action.VIEW\" />\n"
+                           "        <category android:name=\"android.intent.category.DEFAULT\" />\n"
+                           "        <category android:name=\"android.intent.category.BROWSABLE\" />\n"
+                           "        <data android:scheme=\"" (xml-escape android-oauth-scheme) "\" />\n"
+                           "      </intent-filter>\n"
+                           "    </activity>\n"))
                     "  </application>\n"
                     "</manifest>\n")]
               [(str "app/src/main/java/" (android-package-path (:android/application-id manifest)) "/MainActivity.java")
                (android-main-activity-java manifest)]
               [(str "app/src/main/java/" (android-package-path (:android/application-id manifest)) "/KotobaShellBridge.java")
                (bridge/android-bridge-java manifest)]
+              (when android-oauth-scheme
+                [(str "app/src/main/java/" (android-package-path (:android/application-id manifest)) "/KotobaShellAuthCallbackActivity.java")
+                 (bridge/android-authorization-java manifest)])
               ["app/src/main/assets/kotoba-shell-bridge.js" (bridge/bridge-js target)]
               ["app/src/main/assets/kotoba-shell-policy.json" (bridge-policy-json target policy)]
               ["app/src/main/kotoba-shell.edn"
@@ -1350,15 +1459,17 @@
 (defn scaffold-target-row
   [output-dir manifest policy target]
   (let [missing (missing-manifest-keys target manifest)
+        invalid (invalid-manifest-keys target manifest)
         known? (contains? supported-shell-targets target)
         root (host/file output-dir (name target))
-        files (scaffold-files target manifest policy)
-        ok? (and known? (empty? missing))]
+        ok? (and known? (empty? missing) (empty? invalid))
+        files (when ok? (scaffold-files target manifest policy))]
     (if-not ok?
       {:target target
        :ok? false
        :root (.getPath root)
        :missing-manifest-keys (or missing [])
+       :invalid-manifest-keys invalid
        :reason (if known? :manifest-invalid :unknown-target)}
       (do
         (doseq [[path body] files]
