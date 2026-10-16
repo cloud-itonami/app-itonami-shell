@@ -787,7 +787,10 @@
 
 (defn- color-literal?
   [v]
-  (boolean (and (string? v) (re-matches #"#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})" v))))
+  ;; The manifest documents CSS-style #RRGGBB. Android resource XML also
+  ;; accepts eight digits, but interprets them as #AARRGGBB, unlike the
+  ;; #RRGGBBAA form callers may expect. Keep this input unambiguous.
+  (boolean (and (string? v) (re-matches #"#[0-9A-Fa-f]{6}" v))))
 
 (defn icon-sources
   "The icon images `manifest` declares for `target`, as
@@ -912,6 +915,23 @@
   "Store-facing manifest values that are present but unusable."
   [target manifest]
   (let [row (fn [k problem] {:key k :value (get manifest k) :problem problem})
+        boolean-or-unset? (fn [k]
+                            (let [v (get manifest k)]
+                              (or (nil? v) (boolean? v))))
+        privacy-api-types-valid? (fn [v]
+                                   (or (nil? v)
+                                       (and (sequential? v)
+                                            (every? (fn [entry]
+                                                      (and (map? entry)
+                                                           (string? (:type entry))
+                                                           (not (str/blank? (:type entry)))
+                                                           (sequential? (:reasons entry))
+                                                           (seq (:reasons entry))
+                                                           (every? (fn [reason]
+                                                                     (and (string? reason)
+                                                                          (not (str/blank? reason))))
+                                                                   (:reasons entry))))
+                                                    v))))
         known-set? (fn [k allowed]
                      (let [v (get manifest k)]
                        (or (nil? v)
@@ -924,12 +944,20 @@
               (not (known-set? :ios/orientations (set (keys ios-orientation-names))))
               (conj (row :ios/orientations :unknown-orientation))
               (not (re-matches #"[0-9]+(\.[0-9]+){0,2}" (ios-build-number manifest)))
-              (conj (row :ios/build-number :not-a-build-number)))
+              (conj (row :ios/build-number :not-a-build-number))
+              (not (boolean-or-unset? :ios/uses-non-exempt-encryption?))
+              (conj (row :ios/uses-non-exempt-encryption? :expected-boolean))
+              (not (privacy-api-types-valid? (:ios/privacy-accessed-api-types manifest)))
+              (conj (row :ios/privacy-accessed-api-types :expected-api-types-and-reasons)))
        :android (let [code (android-version-code manifest)
                       adaptive (:android/adaptive-icon manifest)]
                   (cond-> []
                     (not (and (integer? code) (<= 1 code 2100000000)))
                     (conj (row :android/version-code :not-a-positive-version-code))
+                    (not (boolean-or-unset? :android/allow-backup?))
+                    (conj (row :android/allow-backup? :expected-boolean))
+                    (not (boolean-or-unset? :android/cleartext-traffic?))
+                    (conj (row :android/cleartext-traffic? :expected-boolean))
                     (and (some? adaptive)
                          (not (and (map? adaptive) (:foreground adaptive) (:background adaptive))))
                     (conj (row :android/adaptive-icon :needs-foreground-and-background))))
