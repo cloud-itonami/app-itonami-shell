@@ -171,6 +171,13 @@ final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply,
     func userContentController(_ userContentController: WKUserContentController,
                                didReceive message: WKScriptMessage,
                                replyHandler: @escaping (Any?, String?) -> Void) {
+        let origin = message.frameInfo.securityOrigin
+        guard message.frameInfo.isMainFrame,
+              origin.protocol.lowercased() == "kotoba-webbundle",
+              origin.host.lowercased() == "app" else {
+            replyHandler(nil, "kotoba-shell: bridge-origin-denied")
+            return
+        }
         guard let body = message.body as? [String: Any],
               let command = body["command"] as? String else {
             replyHandler(nil, "kotoba-shell: request must be {command, args}")

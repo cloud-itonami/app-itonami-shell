@@ -7,11 +7,9 @@ package {{PACKAGE}};
 // to an attached device; a distributed .apk has no adb. These providers are
 // compiled into the app.
 //
-// @JavascriptInterface methods run on a private binder thread and must not
-// block, so `request` hands the work to an executor and the result comes back
-// through evaluateJavascript into __kotobaShellDeliver. Apple's
-// WKScriptMessageHandlerWithReply returns a promise directly; the JS shim
-// hides that difference.
+// WebMessageListener provides the caller's origin and a reply proxy scoped to
+// that frame. Requests are handed to an executor; the JS shim hides the
+// transport difference from Apple's WKScriptMessageHandlerWithReply.
 //
 // The policy decision below matches kotoba.shell.launcher/policy-decision and
 // KotobaShellBridge.swift clause for clause. A missing policy asset denies
@@ -30,8 +28,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.util.Base64;
-import android.webkit.JavascriptInterface;
-import android.webkit.WebView;
+import androidx.webkit.JavaScriptReplyProxy;
 
 import org.json.JSONObject;
 
@@ -51,6 +48,7 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -95,11 +93,11 @@ public final class KotobaShellBridge {
     private static volatile WeakReference<KotobaShellBridge> active = new WeakReference<>(null);
 
     private final Activity activity;
-    private final WebView webView;
     private final Set<String> allow = new HashSet<>();
     private final Set<String> deny = new HashSet<>();
     private final JSONObject capabilities;
     private final ExecutorService executor = Executors.newFixedThreadPool(2);
+    private final ConcurrentHashMap<String, JavaScriptReplyProxy> pendingReplies = new ConcurrentHashMap<>();
     private AuthorizationLauncher authorizationLauncher;
     // One sign-in at a time: the request id waiting for a redirect, and
     // whether the browser has actually been launched for it (only then does
@@ -107,9 +105,8 @@ public final class KotobaShellBridge {
     private String pendingAuthorizationId;
     private boolean authorizationLaunched;
 
-    public KotobaShellBridge(Activity activity, WebView webView, JSONObject policy) {
+    public KotobaShellBridge(Activity activity, JSONObject policy) {
         this.activity = activity;
-        this.webView = webView;
         this.capabilities = policy.optJSONObject("capabilities") != null
                 ? policy.optJSONObject("capabilities")
                 : new JSONObject();
@@ -168,18 +165,35 @@ public final class KotobaShellBridge {
 
     // ---- transport -------------------------------------------------------
 
-    @JavascriptInterface
-    public void request(final String id, final String command, final String argsJson) {
+    public void request(final String requestJson, final JavaScriptReplyProxy replyProxy) {
         executor.execute(new Runnable() {
             @Override
             public void run() {
-                JSONObject args;
+                JSONObject request;
                 try {
-                    args = argsJson == null || argsJson.isEmpty()
-                            ? new JSONObject()
-                            : new JSONObject(argsJson);
+                    request = new JSONObject(requestJson);
                 } catch (Exception e) {
-                    deliver(id, envelope(command, false, null, "malformed-args", denial(command)));
+                    postResponse(replyProxy, "", envelope("", false, null, "malformed-request", denial("")));
+                    return;
+                }
+                String id = request.optString("id", "");
+                String command = request.optString("command", "");
+                Object rawArgs = request.opt("args");
+                JSONObject args;
+                if (rawArgs == null || rawArgs == JSONObject.NULL) {
+                    args = new JSONObject();
+                } else if (rawArgs instanceof JSONObject) {
+                    args = (JSONObject) rawArgs;
+                } else {
+                    postResponse(replyProxy, id, envelope(command, false, null, "malformed-args", denial(command)));
+                    return;
+                }
+                if (id.isEmpty() || command.isEmpty()) {
+                    postResponse(replyProxy, id, envelope(command, false, null, "malformed-request", denial(command)));
+                    return;
+                }
+                if (pendingReplies.putIfAbsent(id, replyProxy) != null) {
+                    postResponse(replyProxy, id, envelope(command, false, null, "duplicate-request-id", denial(command)));
                     return;
                 }
                 JSONObject verdict = denial(command);
@@ -203,12 +217,24 @@ public final class KotobaShellBridge {
     }
 
     private void deliver(final String id, final JSONObject payload) {
-        final String script = "window.__kotobaShellDeliver("
-                + JSONObject.quote(id) + "," + JSONObject.quote(payload.toString()) + ")";
-        webView.post(new Runnable() {
+        final JavaScriptReplyProxy replyProxy = pendingReplies.remove(id);
+        if (replyProxy != null) {
+            postResponse(replyProxy, id, payload);
+        }
+    }
+
+    private void postResponse(final JavaScriptReplyProxy replyProxy, final String id, final JSONObject payload) {
+        activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                webView.evaluateJavascript(script, null);
+                JSONObject response = new JSONObject();
+                try {
+                    response.put("id", id);
+                    response.put("payload", payload);
+                    replyProxy.postMessage(response.toString());
+                } catch (Exception ignored) {
+                    // JSONObject only rejects null keys; the bridge uses fixed keys.
+                }
             }
         });
     }

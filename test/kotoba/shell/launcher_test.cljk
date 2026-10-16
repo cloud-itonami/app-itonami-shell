@@ -1631,7 +1631,7 @@
     (is (= "kotoba.shell.stack-e2e.v0" (:schema receipt)))
     (is (true? (get-in receipt [:source :present?])))
     (is (true? (get-in receipt [:app-source :present?])))
-    (is (true? (get-in receipt [:aiueos :granted?])))
+    (is (true? (get-in receipt [:grant :granted?])))
     (is (= 120 (get-in receipt [:kototama :result])))
     (is (= 3 (get-in receipt [:shell :ops-count])))
     (is (true? (get-in receipt [:kotobase :persisted?])))))

@@ -580,6 +580,10 @@ Android's WebView serves the bundle from a `WebViewAssetLoader` origin
 `file:///android_asset/`. An opaque origin has no DOM storage, no IndexedDB,
 and nothing for document-start script injection to match — the same class of
 problem the Apple side already fixed by leaving `file://` for a custom scheme.
+The native bridge is exposed only through AndroidX `WebMessageListener`,
+restricted to that origin and the main frame; providers without that feature
+fail closed with `available: false` rather than falling back to an
+origin-blind JavaScript interface.
 
 `app scaffold` generates minimal macOS, iOS, Android, and Windows native
 project skeletons from the EDN app manifest. The generated projects carry the
@@ -636,10 +640,22 @@ as warnings, while `--strict` is intended for CI/device-farm gates.
 iOS/Android device readiness with an optional external device-farm command and
 only runs that command when `--execute` is present.
 
-`e2e stack` closes the load-bearing reference loop: aiueos makes a real grant
-decision, kototama executes a checked-in Kotoba-compiled Wasm guest, shell
+`e2e stack` closes the load-bearing reference loop: a real grant decision is
+asked for, kototama executes a checked-in Kotoba-compiled Wasm guest, shell
 commits `kotoba:dom` operations, and kotobase appends then reads back one
-correlated receipt. `resources/kotoba/shell/app/tauri_equivalent.kotoba` is the
+correlated receipt. The decision step (`src/kotoba/shell/stack_e2e.cljk`) runs
+`kbb -M -e` in the sibling `../grant` checkout and calls
+`grant.cli/command-result :verify`; the receipt records it as
+`:grant {:granted? ...}`. Grant decisions moved from aiueos to
+`kotoba-lang/grant` under root ADR-2608219500 (2026-08-21), when aiueos removed
+`aiueos.cli`. `grant.cli/read-contract` is JVM-only, so the step rebuilds the
+contract from grant's `aiueos/cli.edn` classpath resource itself. Run alone on
+2026-10-13 it returned `:aiueos/decision :grant`. The whole command does not
+complete on the kbb engine yet: kotobase is loaded first through
+`host/load-source-file`, which is JVM-only and throws there, and kototama's
+`kbb -M:cli run` stops at `Unable to resolve classname:
+com.dylibso.chicory.runtime.ExecutionListener`.
+`resources/kotoba/shell/app/tauri_equivalent.kotoba` is the
 Kotoba-owned application readiness source. `app run --execute` is the macOS T1
 path for manifest applications: it evaluates the declared pure app entry,
 passes its `kotoba:dom` operations to the shell-owned AppKit host, and records
