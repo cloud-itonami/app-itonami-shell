@@ -511,6 +511,10 @@ Android's WebView serves the bundle from a `WebViewAssetLoader` origin
 `file:///android_asset/`. An opaque origin has no DOM storage, no IndexedDB,
 and nothing for document-start script injection to match — the same class of
 problem the Apple side already fixed by leaving `file://` for a custom scheme.
+The native bridge is exposed only through AndroidX `WebMessageListener`,
+restricted to that origin and the main frame; providers without that feature
+fail closed with `available: false` rather than falling back to an
+origin-blind JavaScript interface.
 
 `app scaffold` generates minimal macOS, iOS, Android, and Windows native
 project skeletons from the EDN app manifest. The generated projects carry the
