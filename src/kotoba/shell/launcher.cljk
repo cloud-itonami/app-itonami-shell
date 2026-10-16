@@ -573,6 +573,8 @@
   (vec (remove #(contains? manifest %)
                (get-in release-target-specs [target :required-manifest-keys]))))
 
+(declare store-manifest-problems)
+
 (defn invalid-manifest-keys
   "Manifest values present but unusable for `target`, as
   `[{:key k :value v :problem kw}]`. Checked before scaffolding because
@@ -580,8 +582,9 @@
   [target manifest]
   (let [k (get bridge/oauth-callback-scheme-keys target)
         scheme (bridge/oauth-callback-scheme target manifest)]
-    (vec (when-let [problem (and k (bridge/oauth-callback-scheme-problem scheme))]
-           [{:key k :value scheme :problem problem}]))))
+    (into (vec (when-let [problem (and k (bridge/oauth-callback-scheme-problem scheme))]
+                 [{:key k :value scheme :problem problem}]))
+          (store-manifest-problems target manifest))))
 
 (defn sanitize-path-part
   [value]
@@ -720,6 +723,399 @@
       (str/replace ">" "&gt;")
       (str/replace "\"" "&quot;")))
 
+;; ─── store readiness: icons, device family, orientation, versions ─────────
+;;
+;; Found 2026-10-14 by building three consumer apps (cloud.itonami.app,
+;; cloud.murakumo.app, app.aozora) toward App Store / Google Play: the
+;; scaffold produced apps with no icon on either platform, an iOS target
+;; that declared iPad support while locking iPad to portrait (App Store
+;; validation rejects that: iPad multitasking needs every orientation or
+;; UIRequiresFullScreen), a build number fixed at "1", and on Android 15 a
+;; title bar drawn over the WebView. Every key below is optional; what a
+;; manifest leaves out falls back to the value that passes store validation.
+
+(def ios-device-family-codes
+  "`:ios/device-family` value → TARGETED_DEVICE_FAMILY code."
+  {:iphone "1" :ipad "2"})
+
+(def ios-orientation-names
+  "`:ios/orientations` value → UIInterfaceOrientation constant."
+  {:portrait "UIInterfaceOrientationPortrait"
+   :portrait-upside-down "UIInterfaceOrientationPortraitUpsideDown"
+   :landscape-left "UIInterfaceOrientationLandscapeLeft"
+   :landscape-right "UIInterfaceOrientationLandscapeRight"})
+
+(defn ios-device-family
+  "Defaults to iPhone only. XcodeGen's own default (and so this scaffold's,
+  until now) was \"1,2\": a native iPad app nobody designed for, which App
+  Store Connect then requires iPad screenshots for and which failed
+  validation because it was portrait-only. An iPhone-only app still installs
+  and runs on iPad (in compatibility mode), so the narrower default loses no
+  user; a consumer that really lays out for iPad opts in with
+  `[:iphone :ipad]`."
+  [manifest]
+  (vec (distinct (or (seq (:ios/device-family manifest)) [:iphone]))))
+
+(defn ios-orientations
+  [manifest]
+  (vec (distinct (or (seq (:ios/orientations manifest)) [:portrait]))))
+
+(defn ios-requires-full-screen?
+  "An iPad target that does not support all four orientations must opt out of
+  multitasking, or App Store validation refuses the upload (ITMS-90474)."
+  [manifest]
+  (boolean (and (some #{:ipad} (ios-device-family manifest))
+                (not= (set (keys ios-orientation-names))
+                      (set (ios-orientations manifest))))))
+
+(defn ios-build-number
+  "CFBundleVersion. Was hardcoded \"1\", so a second upload of any app was
+  refused as a duplicate build."
+  [manifest]
+  (str (or (:ios/build-number manifest) 1)))
+
+(defn android-version-code
+  [manifest]
+  (or (:android/version-code manifest) 1))
+
+(def android-icon-densities
+  "Launcher densities and their scale over mdpi."
+  [["mdpi" 1] ["hdpi" 1.5] ["xhdpi" 2] ["xxhdpi" 3] ["xxxhdpi" 4]])
+
+(def ^:private ios-app-icon-dest
+  "Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png")
+
+(defn- color-literal?
+  [v]
+  ;; The manifest documents CSS-style #RRGGBB. Android resource XML also
+  ;; accepts eight digits, but interprets them as #AARRGGBB, unlike the
+  ;; #RRGGBBAA form callers may expect. Keep this input unambiguous.
+  (boolean (and (string? v) (re-matches #"#[0-9A-Fa-f]{6}" v))))
+
+(defn icon-sources
+  "The icon images `manifest` declares for `target`, as
+  `[{:key k :path declared :role r :min-px n :exact-px n :opaque? b}]`.
+
+  `:ios/icon` — one 1024×1024 PNG with no alpha channel. Xcode 14+ builds
+  every size from that single image (single-size AppIcon), and App Store
+  validation rejects an icon that has an alpha channel at all, even a fully
+  opaque one, so the check is on the PNG's color type rather than on pixels.
+
+  `:android/icon` — a square legacy launcher icon (≥192 px, the xxxhdpi
+  size), scaled to every density. `:android/adaptive-icon {:foreground
+  :background :monochrome}` — the API 26+ layered icon; layers are square
+  PNGs ≥432 px (108 dp at xxxhdpi), `:background` may instead be a
+  `#RRGGBB` color, `:monochrome` (Android 13 themed icons) is optional.
+  minSdk is 26, so an adaptive icon alone covers every device."
+  [target manifest]
+  (case target
+    :ios (if-let [p (:ios/icon manifest)]
+           [{:key :ios/icon :path p :role :ios-app-icon :exact-px 1024 :opaque? true}]
+           [])
+    :android (let [adaptive (:android/adaptive-icon manifest)
+                   layer (fn [k] {:key [:android/adaptive-icon k] :path (get adaptive k)
+                                  :role k :min-px 432})]
+               (cond-> []
+                 (:android/icon manifest)
+                 (conj {:key :android/icon :path (:android/icon manifest) :role :legacy :min-px 192})
+                 (:foreground adaptive) (conj (layer :foreground))
+                 (and (:background adaptive) (not (color-literal? (:background adaptive))))
+                 (conj (layer :background))
+                 (:monochrome adaptive) (conj (layer :monochrome))))
+    []))
+
+(defn icon-images
+  "`[{:src declared-path :dest relative-path :px n-or-nil}]` — the image files
+  `app scaffold` writes for `target`. `:px nil` copies the source as is."
+  [target manifest]
+  (vec (mapcat (fn [{:keys [role path]}]
+                 (case role
+                   :ios-app-icon [{:src path :dest ios-app-icon-dest :px nil}]
+                   (let [[file-name dp] (case role
+                                          :legacy ["ic_launcher.png" 48]
+                                          :foreground ["ic_launcher_foreground.png" 108]
+                                          :background ["ic_launcher_background.png" 108]
+                                          :monochrome ["ic_launcher_monochrome.png" 108])]
+                     (for [[density scale] android-icon-densities]
+                       {:src path
+                        :dest (str "app/src/main/res/mipmap-" density "/" file-name)
+                        :px (int (* dp scale))}))))
+               (icon-sources target manifest))))
+
+(defn icon-check-paths
+  "Icon outputs `app check` requires. Only xxxhdpi on Android: without
+  `sips` the scaffold writes that density alone (see write-icon-images!)."
+  [target manifest]
+  (vec (keep (fn [{:keys [dest]}]
+               (when (or (= target :ios) (str/includes? dest "mipmap-xxxhdpi/"))
+                 dest))
+             (icon-images target manifest))))
+
+(defn png-info
+  "`{:width :height :color-type :alpha?}` from a PNG's header chunks, or nil
+  when the bytes are not a PNG. `:alpha?` is true for a color type with an
+  alpha channel (4, 6) or a tRNS chunk — what App Store validation rejects —
+  regardless of whether any pixel is actually transparent."
+  [bs]
+  (let [n (count bs)
+        u32 (fn [i] (+ (* (nth bs i) 16777216) (* (nth bs (+ i 1)) 65536)
+                       (* (nth bs (+ i 2)) 256) (nth bs (+ i 3))))
+        chunk-type (fn [i] (apply str (map #(char (nth bs %)) (range (+ i 4) (+ i 8)))))]
+    (when (and (>= n 33) (= [137 80 78 71 13 10 26 10] (subvec (vec bs) 0 8))
+               (= "IHDR" (chunk-type 8)))
+      (let [color-type (nth bs 25)]
+        (loop [i 8 trns? false]
+          (if (> (+ i 8) n)
+            nil
+            (let [t (chunk-type i)]
+              (if (#{"IDAT" "IEND"} t)
+                {:width (u32 16) :height (u32 20) :color-type color-type
+                 :alpha? (or trns? (contains? #{4 6} color-type))}
+                (recur (+ i 12 (u32 i)) (or trns? (= "tRNS" t)))))))))))
+
+(defn manifest-base-dir
+  "Icon paths resolve against the manifest's directory, as `:app/icon` does
+  for `app run`, so a manifest stays portable across checkouts. With no
+  `--manifest` file (inline `--manifest-edn`) they resolve against the
+  working directory."
+  [argv]
+  (if-let [m (option-value argv "--manifest")]
+    (or (some-> (host/file m) .getCanonicalFile .getParent) ".")
+    "."))
+
+(defn- resolve-manifest-file
+  [base-dir p]
+  (let [declared (host/file (str p))]
+    (if (.isAbsolute declared) declared (host/file base-dir (str p)))))
+
+(defn icon-problems
+  "Declared icons that cannot ship, as `{:key :value :problem}` rows in the
+  shape of `invalid-manifest-keys`. Reads only each PNG's header."
+  [target manifest base-dir]
+  (vec (keep (fn [{:keys [key path exact-px min-px opaque?]}]
+               (let [row (fn [problem & kvs] (apply assoc {:key key :value path :problem problem} kvs))
+                     f (when (string? path) (resolve-manifest-file base-dir path))]
+                 (cond
+                   (not (string? path)) (row :icon-path-not-a-string)
+                   (not (.isFile f)) (row :icon-file-missing :resolved (.getPath f))
+                   :else
+                   (let [{:keys [width height alpha?] :as info} (png-info (host/read-file-bytes f))]
+                     (cond
+                       (nil? info) (row :icon-not-png)
+                       (not= width height) (row :icon-not-square :width width :height height)
+                       (and exact-px (not= exact-px width))
+                       (row :icon-wrong-size :width width :height height :required exact-px)
+                       (and min-px (< width min-px))
+                       (row :icon-too-small :width width :height height :required min-px)
+                       (and opaque? alpha?) (row :icon-has-alpha)
+                       :else nil)))))
+             (icon-sources target manifest))))
+
+(defn store-manifest-problems
+  "Store-facing manifest values that are present but unusable."
+  [target manifest]
+  (let [row (fn [k problem] {:key k :value (get manifest k) :problem problem})
+        boolean-or-unset? (fn [k]
+                            (let [v (get manifest k)]
+                              (or (nil? v) (boolean? v))))
+        privacy-api-types-valid? (fn [v]
+                                   (or (nil? v)
+                                       (and (sequential? v)
+                                            (every? (fn [entry]
+                                                      (and (map? entry)
+                                                           (string? (:type entry))
+                                                           (not (str/blank? (:type entry)))
+                                                           (sequential? (:reasons entry))
+                                                           (seq (:reasons entry))
+                                                           (every? (fn [reason]
+                                                                     (and (string? reason)
+                                                                          (not (str/blank? reason))))
+                                                                   (:reasons entry))))
+                                                    v))))
+        known-set? (fn [k allowed]
+                     (let [v (get manifest k)]
+                       (or (nil? v)
+                           (and (sequential? v) (seq v) (every? allowed v)))))]
+    (vec
+     (case target
+       :ios (cond-> []
+              (not (known-set? :ios/device-family (set (keys ios-device-family-codes))))
+              (conj (row :ios/device-family :expected-iphone-and-or-ipad))
+              (not (known-set? :ios/orientations (set (keys ios-orientation-names))))
+              (conj (row :ios/orientations :unknown-orientation))
+              (not (re-matches #"[0-9]+(\.[0-9]+){0,2}" (ios-build-number manifest)))
+              (conj (row :ios/build-number :not-a-build-number))
+              (not (boolean-or-unset? :ios/uses-non-exempt-encryption?))
+              (conj (row :ios/uses-non-exempt-encryption? :expected-boolean))
+              (not (privacy-api-types-valid? (:ios/privacy-accessed-api-types manifest)))
+              (conj (row :ios/privacy-accessed-api-types :expected-api-types-and-reasons)))
+       :android (let [code (android-version-code manifest)
+                      adaptive (:android/adaptive-icon manifest)]
+                  (cond-> []
+                    (not (and (integer? code) (<= 1 code 2100000000)))
+                    (conj (row :android/version-code :not-a-positive-version-code))
+                    (not (boolean-or-unset? :android/allow-backup?))
+                    (conj (row :android/allow-backup? :expected-boolean))
+                    (not (boolean-or-unset? :android/cleartext-traffic?))
+                    (conj (row :android/cleartext-traffic? :expected-boolean))
+                    (and (some? adaptive)
+                         (not (and (map? adaptive) (:foreground adaptive) (:background adaptive))))
+                    (conj (row :android/adaptive-icon :needs-foreground-and-background))))
+       []))))
+
+(defn store-warnings
+  "Not errors — a simulator or debug build needs none of these — but what a
+  store upload of this scaffold would be refused for."
+  [target manifest]
+  (case target
+    :ios (cond-> []
+           (nil? (:ios/icon manifest)) (conj :ios/icon-not-declared))
+    :android (cond-> []
+               (and (nil? (:android/icon manifest)) (nil? (:android/adaptive-icon manifest)))
+               (conj :android/icon-not-declared))
+    []))
+
+(defn- resize-png!
+  [src dest px]
+  (let [{:keys [exit stdout]} (run-native-host-command
+                               "sips" ["-s" "format" "png" "-z" (str px) (str px)
+                                       (.getPath src) "--out" (.getPath dest)]
+                               nil 60)]
+    (when-not (zero? (or exit 1))
+      (throw (ex-info (str "sips failed: " stdout) {:src (.getPath src)})))))
+
+(defn write-icon-images!
+  "Copies (iOS) or scales (Android) the declared icons into `root`. Android
+  densities are scaled with `sips` (macOS). Where `sips` cannot run, the
+  source is copied unscaled into mipmap-xxxhdpi alone — Android scales a
+  launcher bitmap down from the nearest density — and the row says so."
+  [target manifest base-dir root]
+  (let [sips? (atom true)]
+    (vec (keep (fn [{:keys [src dest px]}]
+                 (let [s (resolve-manifest-file base-dir src)
+                       d (host/file root dest)]
+                   (.mkdirs (.getParentFile d))
+                   (cond
+                     (nil? px) (do (host/copy-file! s d) {:dest dest :method :copied})
+                     @sips? (try (resize-png! s d px) {:dest dest :px px :method :sips}
+                                 (catch #?(:clj Exception :cljs :default) _
+                                   (reset! sips? false)
+                                   (when (str/includes? dest "mipmap-xxxhdpi/")
+                                     (host/copy-file! s d)
+                                     {:dest dest :method :copied-unscaled})))
+                     (str/includes? dest "mipmap-xxxhdpi/")
+                     (do (host/copy-file! s d) {:dest dest :method :copied-unscaled})
+                     :else nil)))
+               (icon-images target manifest)))))
+
+(def ^:private plist-header
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"))
+
+(defn ios-privacy-manifest
+  "PrivacyInfo.xcprivacy. The generated Swift calls none of Apple's
+  required-reason APIs (no UserDefaults, file timestamps, system boot time,
+  disk space or active keyboards — checked when this was written), tracks
+  nothing and collects nothing natively, so every list is empty. A consumer
+  whose native additions do use one declares it with
+  `:ios/privacy-accessed-api-types [{:type \"NSPrivacyAccessedAPICategoryUserDefaults\"
+  :reasons [\"CA92.1\"]}]` instead of editing the generated file."
+  [manifest]
+  (str plist-header
+       "<plist version=\"1.0\">\n<dict>\n"
+       "\t<key>NSPrivacyTracking</key>\n\t<false/>\n"
+       "\t<key>NSPrivacyTrackingDomains</key>\n\t<array/>\n"
+       "\t<key>NSPrivacyCollectedDataTypes</key>\n\t<array/>\n"
+       "\t<key>NSPrivacyAccessedAPITypes</key>\n"
+       (if-let [types (seq (:ios/privacy-accessed-api-types manifest))]
+         (str "\t<array>\n"
+              (str/join
+               (for [{:keys [type reasons]} types]
+                 (str "\t\t<dict>\n"
+                      "\t\t\t<key>NSPrivacyAccessedAPIType</key>\n"
+                      "\t\t\t<string>" (xml-escape type) "</string>\n"
+                      "\t\t\t<key>NSPrivacyAccessedAPITypeReasons</key>\n\t\t\t<array>\n"
+                      (str/join (for [r reasons] (str "\t\t\t\t<string>" (xml-escape r) "</string>\n")))
+                      "\t\t\t</array>\n\t\t</dict>\n")))
+              "\t</array>\n")
+         "\t<array/>\n")
+       "</dict>\n</plist>\n"))
+
+(defn ios-asset-catalog-files
+  "The asset catalog around AppIcon.png (written by write-icon-images!).
+  Single-size: one 1024 universal entry, which Xcode 14+ expands to every
+  device size at build time (deployment target here is iOS 16)."
+  [manifest]
+  (when (:ios/icon manifest)
+    [["Resources/Assets.xcassets/Contents.json"
+      "{\n  \"info\" : { \"author\" : \"kotoba-shell\", \"version\" : 1 }\n}\n"]
+     ["Resources/Assets.xcassets/AppIcon.appiconset/Contents.json"
+      (str "{\n  \"images\" : [\n    {\n      \"filename\" : \"AppIcon.png\",\n"
+           "      \"idiom\" : \"universal\",\n      \"platform\" : \"ios\",\n"
+           "      \"size\" : \"1024x1024\"\n    }\n  ],\n"
+           "  \"info\" : { \"author\" : \"kotoba-shell\", \"version\" : 1 }\n}\n")]]))
+
+(defn android-icon-resource-files
+  "Adaptive-icon XML (mipmap-anydpi-v26, which every device at minSdk 26
+  uses) and a color resource when `:background` is a color."
+  [manifest]
+  (when-let [{:keys [background monochrome]} (:android/adaptive-icon manifest)]
+    (let [bg (if (color-literal? background)
+               "@color/ic_launcher_background"
+               "@mipmap/ic_launcher_background")
+          xml (str "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                   "<adaptive-icon xmlns:android=\"http://schemas.android.com/apk/res/android\">\n"
+                   "    <background android:drawable=\"" bg "\" />\n"
+                   "    <foreground android:drawable=\"@mipmap/ic_launcher_foreground\" />\n"
+                   (when monochrome
+                     "    <monochrome android:drawable=\"@mipmap/ic_launcher_monochrome\" />\n")
+                   "</adaptive-icon>\n")]
+      (cond-> [["app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" xml]
+               ["app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml" xml]]
+        (color-literal? background)
+        (conj ["app/src/main/res/values/ic_launcher_background.xml"
+               (str "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n"
+                    "    <color name=\"ic_launcher_background\">" background "</color>\n"
+                    "</resources>\n")])))))
+
+(declare android-theme-files)
+
+(defn store-resource-files
+  "The text resources store readiness adds to a target's scaffold: the
+  privacy manifest and icon asset catalog on iOS, the theme and adaptive-icon
+  XML on Android. Icon images themselves are written by write-icon-images!."
+  [target manifest]
+  (case target
+    :ios (into [["Resources/PrivacyInfo.xcprivacy" (ios-privacy-manifest manifest)]]
+               (ios-asset-catalog-files manifest))
+    :android (into (vec android-theme-files) (android-icon-resource-files manifest))
+    []))
+
+(def android-theme-files
+  "No action bar. With the framework default theme the activity got a title
+  bar, and on Android 15 (targetSdk 35 enforces edge-to-edge) it and the
+  status bar were drawn over the WebView — a page's top tab bar sat under
+  them. MainActivity pads the WebView by the system-bar, cutout and IME
+  insets instead (see android-main-activity-java). Bar colors only matter
+  below API 35; from 35 the bars are transparent over the window
+  background."
+  [["app/src/main/res/values/themes.xml"
+    (str "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n"
+         "    <style name=\"KotobaShellTheme\" parent=\"@android:style/Theme.Material.Light.NoActionBar\">\n"
+         "        <item name=\"android:windowBackground\">@android:color/white</item>\n"
+         "        <item name=\"android:statusBarColor\">@android:color/white</item>\n"
+         "        <item name=\"android:windowLightStatusBar\">true</item>\n"
+         "    </style>\n</resources>\n")]
+   ["app/src/main/res/values-v27/themes.xml"
+    (str "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n"
+         "    <style name=\"KotobaShellTheme\" parent=\"@android:style/Theme.Material.Light.NoActionBar\">\n"
+         "        <item name=\"android:windowBackground\">@android:color/white</item>\n"
+         "        <item name=\"android:statusBarColor\">@android:color/white</item>\n"
+         "        <item name=\"android:windowLightStatusBar\">true</item>\n"
+         "        <item name=\"android:navigationBarColor\">@android:color/white</item>\n"
+         "        <item name=\"android:windowLightNavigationBar\">true</item>\n"
+         "    </style>\n</resources>\n")]])
+
 (defn product-name-for
   "The Xcode product/project/scheme name for `target`.
 
@@ -837,9 +1233,24 @@
                           ;; UILaunchScreen だけ空辞書で用意し、別途 storyboard を
                           ;; 用意しなくても xcodebuild が起動画面要件を満たせるように
                           ;; する(iOS 13+ の推奨最小構成)。
-                          :ios (str "        UILaunchScreen: {}\n"
-                                    "        UISupportedInterfaceOrientations:\n"
-                                    "          - UIInterfaceOrientationPortrait\n"))]
+                          :ios (let [orientations (str/join
+                                                   (map #(str "          - " (get ios-orientation-names %) "\n")
+                                                        (ios-orientations manifest)))]
+                                 (str "        UILaunchScreen: {}\n"
+                                      "        LSRequiresIPhoneOS: true\n"
+                                      ;; HTTPS and the OS keychain only: exempt
+                                      ;; encryption, so App Store Connect does
+                                      ;; not hold every build for the export
+                                      ;; compliance question.
+                                      "        ITSAppUsesNonExemptEncryption: "
+                                      (if (:ios/uses-non-exempt-encryption? manifest) "true" "false") "\n"
+                                      "        UISupportedInterfaceOrientations:\n"
+                                      orientations
+                                      (when (some #{:ipad} (ios-device-family manifest))
+                                        (str "        \"UISupportedInterfaceOrientations~ipad\":\n"
+                                             orientations))
+                                      (when (ios-requires-full-screen? manifest)
+                                        "        UIRequiresFullScreen: true\n"))))]
     (str "name: " product-name "\n"
          "options:\n"
          "  createIntermediateGroups: true\n"
@@ -862,7 +1273,7 @@
          "      path: Info.plist\n"
          "      properties:\n"
          "        CFBundleShortVersionString: \"" (:app/version manifest) "\"\n"
-         "        CFBundleVersion: \"1\"\n"
+         "        CFBundleVersion: \"" (if (= target :ios) (ios-build-number manifest) "1") "\"\n"
          ;; The app is called what the manifest calls it, on the Home screen
          ;; and in every system sheet. Without these, CFBundleName falls back
          ;; to $(PRODUCT_NAME), which is the shell's own default whenever a
@@ -878,6 +1289,12 @@
          "        PRODUCT_NAME: " product-name "\n"
          "        PRODUCT_BUNDLE_IDENTIFIER: " bundle-id "\n"
          "        MARKETING_VERSION: \"" (:app/version manifest) "\"\n"
+         (when (= target :ios)
+           (str "        CURRENT_PROJECT_VERSION: \"" (ios-build-number manifest) "\"\n"
+                "        TARGETED_DEVICE_FAMILY: \""
+                (str/join "," (map ios-device-family-codes (ios-device-family manifest))) "\"\n"
+                (when (:ios/icon manifest)
+                  "        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon\n")))
          (signing-settings-yml target manifest)
          "    dependencies:\n"
          ;; distinct, not concatenated: the in-app bridge and the
@@ -1039,6 +1456,57 @@
        "app.delegate = delegate\n"
        "app.run()\n"))
 
+(def ^:private ios-external-navigation-swift
+  "Links that leave the bundle. Without a navigation delegate a `mailto:`
+  link did nothing at all (WKWebView has no handler for it), and an https
+  link to another origin either did nothing (target=_blank) or replaced the
+  app with that site inside the app's own web view -- one that carries the
+  provider bridge. App Store guideline 1.2 needs a report channel that
+  works, and aozora's is a mailto link. So: the bundle's own scheme (and
+  about:/blob:/data:) stays in the web view; mailto/tel/sms/facetime open
+  through the system; an http(s) navigation of the main frame or a new
+  window opens in the default browser and is cancelled here; subframes load
+  normally (embedded content); anything else is refused."
+  (str "import UIKit\n"
+       "import WebKit\n\n"
+       "final class KotobaExternalNavigationPolicy: NSObject, WKNavigationDelegate, WKUIDelegate {\n"
+       "    static let inPlaceSchemes: Set<String> = [KotobaWebBundleSchemeHandler.scheme, \"about\", \"blob\", \"data\"]\n"
+       "    static let systemSchemes: Set<String> = [\"mailto\", \"tel\", \"sms\", \"facetime\"]\n\n"
+       "    func webView(_ webView: WKWebView,\n"
+       "                 decidePolicyFor navigationAction: WKNavigationAction,\n"
+       "                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {\n"
+       "        guard let url = navigationAction.request.url, let scheme = url.scheme?.lowercased() else {\n"
+       "            decisionHandler(.cancel)\n"
+       "            return\n"
+       "        }\n"
+       "        if Self.inPlaceSchemes.contains(scheme) {\n"
+       "            decisionHandler(.allow)\n"
+       "            return\n"
+       "        }\n"
+       "        // nil targetFrame: target=_blank, a new window.\n"
+       "        let mainFrame = navigationAction.targetFrame?.isMainFrame ?? true\n"
+       "        if (scheme == \"http\" || scheme == \"https\") && !mainFrame {\n"
+       "            decisionHandler(.allow)\n"
+       "            return\n"
+       "        }\n"
+       "        if Self.systemSchemes.contains(scheme) || scheme == \"http\" || scheme == \"https\" {\n"
+       "            UIApplication.shared.open(url, options: [:], completionHandler: nil)\n"
+       "        }\n"
+       "        decisionHandler(.cancel)\n"
+       "    }\n\n"
+       "    // window.open: never a second in-app web view.\n"
+       "    func webView(_ webView: WKWebView,\n"
+       "                 createWebViewWith configuration: WKWebViewConfiguration,\n"
+       "                 for navigationAction: WKNavigationAction,\n"
+       "                 windowFeatures: WKWindowFeatures) -> WKWebView? {\n"
+       "        if let url = navigationAction.request.url, let scheme = url.scheme?.lowercased(),\n"
+       "           Self.systemSchemes.contains(scheme) || scheme == \"http\" || scheme == \"https\" {\n"
+       "            UIApplication.shared.open(url, options: [:], completionHandler: nil)\n"
+       "        }\n"
+       "        return nil\n"
+       "    }\n"
+       "}\n"))
+
 (def ^:private ios-app-delegate-swift
   (str "import UIKit\n"
        "import WebKit\n\n"
@@ -1050,7 +1518,8 @@
        "final class AppDelegate: UIResponder, UIApplicationDelegate {\n"
        "    var window: UIWindow?\n"
        "    private var schemeHandler: KotobaWebBundleSchemeHandler?\n"
-       "    private var bridge: KotobaShellBridge?\n\n"
+       "    private var bridge: KotobaShellBridge?\n"
+       "    private let navigationPolicy = KotobaExternalNavigationPolicy()\n\n"
        "    func application(_ application: UIApplication,\n"
        "                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {\n"
        "        let config = WKWebViewConfiguration()\n"
@@ -1062,6 +1531,8 @@
        "            config.setURLSchemeHandler(handler, forURLScheme: KotobaWebBundleSchemeHandler.scheme)\n"
        "        }\n"
        "        let webView = WKWebView(frame: UIScreen.main.bounds, configuration: config)\n"
+       "        webView.navigationDelegate = navigationPolicy\n"
+       "        webView.uiDelegate = navigationPolicy\n"
        "        if let indexURL = URL(string: \"\\(KotobaWebBundleSchemeHandler.scheme)://app/index.html\") {\n"
        "            webView.load(URLRequest(url: indexURL))\n"
        "        }\n"
@@ -1106,7 +1577,10 @@
        "import android.webkit.WebResourceResponse;\n"
        "import android.webkit.WebSettings;\n"
        "import android.webkit.WebView;\n"
-       "import android.webkit.WebViewClient;\n\n"
+       "import android.webkit.WebViewClient;\n"
+       "import android.view.View;\n"
+       "import android.view.WindowInsets;\n"
+       "import android.widget.FrameLayout;\n\n"
        "import androidx.webkit.WebViewAssetLoader;\n"
        "import androidx.webkit.JavaScriptReplyProxy;\n"
        "import androidx.webkit.WebMessageCompat;\n"
@@ -1116,7 +1590,8 @@
        "public class MainActivity extends Activity {\n"
        ;; A field, not a local: onResume needs it to notice a sign-in the
        ;; user abandoned (Custom Tabs has no "closed" callback).
-       "    private KotobaShellBridge bridge;\n\n"
+       "    private KotobaShellBridge bridge;\n"
+       "    private WebView webView;\n\n"
        "    @Override\n"
        "    protected void onResume() {\n"
        "        super.onResume();\n"
@@ -1127,7 +1602,8 @@
        "    @Override\n"
        "    protected void onCreate(Bundle savedInstanceState) {\n"
        "        super.onCreate(savedInstanceState);\n"
-       "        WebView webView = new WebView(this);\n"
+       "        final WebView webView = new WebView(this);\n"
+       "        this.webView = webView;\n"
        "        WebSettings settings = webView.getSettings();\n"
        "        settings.setJavaScriptEnabled(true);\n"
        "        settings.setDomStorageEnabled(true);\n\n"
@@ -1182,6 +1658,39 @@
        "            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {\n"
        "                return loader.shouldInterceptRequest(request.getUrl());\n"
        "            }\n\n"
+       ;; Links that leave the bundle -- the Android half of
+       ;; ios-external-navigation-swift, same rules: the app origin stays in
+       ;; the WebView; mailto (ACTION_SENDTO, so only mail apps offer
+       ;; themselves) and tel/sms open through the system; an http(s) main
+       ;; frame navigation elsewhere opens in the browser rather than inside a
+       ;; WebView that exposes the provider bridge; subframes load; anything
+       ;; else (intent:, file:, javascript:) is refused. target=_blank
+       ;; arrives here too: multiple windows are not enabled, so it navigates
+       ;; this WebView and is caught by the same check.
+       "            @Override\n"
+       "            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {\n"
+       "                android.net.Uri uri = request.getUrl();\n"
+       "                String scheme = uri.getScheme() == null ? \"\" : uri.getScheme().toLowerCase(java.util.Locale.ROOT);\n"
+       "                boolean web = scheme.equals(\"http\") || scheme.equals(\"https\");\n"
+       "                if (web && \"" (subs android-app-origin (count "https://")) "\".equals(uri.getHost())) {\n"
+       "                    return false;\n"
+       "                }\n"
+       "                if (scheme.equals(\"about\") || scheme.equals(\"blob\") || scheme.equals(\"data\")\n"
+       "                        || (web && !request.isForMainFrame())) {\n"
+       "                    return false;\n"
+       "                }\n"
+       "                if (web || scheme.equals(\"mailto\") || scheme.equals(\"tel\") || scheme.equals(\"sms\")) {\n"
+       "                    android.content.Intent intent = new android.content.Intent(\n"
+       "                            scheme.equals(\"mailto\") ? android.content.Intent.ACTION_SENDTO\n"
+       "                                                     : android.content.Intent.ACTION_VIEW, uri);\n"
+       "                    try {\n"
+       "                        startActivity(intent);\n"
+       "                    } catch (android.content.ActivityNotFoundException e) {\n"
+       "                        android.util.Log.w(\"kotoba-shell\", \"no app for \" + scheme + \" link\");\n"
+       "                    }\n"
+       "                }\n"
+       "                return true;\n"
+       "            }\n\n"
        "            @Override\n"
        "            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {\n"
        "                android.net.Uri page = android.net.Uri.parse(url);\n"
@@ -1195,11 +1704,7 @@
        "                }\n"
        "            }\n"
        "        });\n\n"
-       ;; POST_NOTIFICATIONS is a runtime permission from API 33. Asked for at
-       ;; startup rather than at first notify/show: a permission sheet that
-       ;; appears in the middle of a provider call would make the call's
-       ;; result depend on how fast someone taps.
-;; The README long claimed Android WebView logs console output to logcat
+       ;; The README long claimed Android WebView logs console output to logcat
        ;; by default. It does not: WebView 113 on a booted emulator produced
        ;; no [INFO:CONSOLE] lines at all with no WebChromeClient set, which
        ;; cost a debugging pass. Forwarded here, and only in a debuggable
@@ -1215,11 +1720,101 @@
        "                }\n"
        "            });\n"
        "        }\n"
-       "        if (Build.VERSION.SDK_INT >= 33) {\n"
-       "            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS}, 1);\n"
-       "        }\n"
+       ;; POST_NOTIFICATIONS is no longer requested here. It was, at every
+       ;; launch, even for an app whose policy denies notify/show -- a
+       ;; permission sheet greeting someone who will never get a
+       ;; notification. The bridge now asks at the first notify/show and waits
+       ;; for the answer (KotobaShellBridge.ensureNotificationPermission), so
+       ;; the call's result is the person's decision, not a race with it.
        "        webView.loadUrl(\"" android-app-origin "/assets/index.html\");\n"
-       "        setContentView(webView);\n"
+       ;; Edge-to-edge (enforced at targetSdk 35): the window extends under
+       ;; the status bar, navigation bar and display cutout. The WebView is
+       ;; padded by those insets -- and by the IME's, since adjustResize no
+       ;; longer resizes an edge-to-edge window -- and the insets are
+       ;; consumed, so the page lays out in the visible area. Consuming them
+       ;; also means a WebView that maps insets to env(safe-area-inset-*)
+       ;; reports 0 there rather than padding twice. Below API 35 (not
+       ;; edge-to-edge) the decor view has already applied them and this
+       ;; pads by zero.
+       "        final FrameLayout root = new FrameLayout(this);\n"
+       "        root.addView(webView, new FrameLayout.LayoutParams(\n"
+       "                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));\n"
+       "        root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {\n"
+       "            @Override\n"
+       "            public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {\n"
+       "                if (Build.VERSION.SDK_INT >= 30) {\n"
+       "                    android.graphics.Insets i = insets.getInsets(WindowInsets.Type.systemBars()\n"
+       "                            | WindowInsets.Type.displayCutout() | WindowInsets.Type.ime());\n"
+       "                    v.setPadding(i.left, i.top, i.right, i.bottom);\n"
+       "                    return WindowInsets.CONSUMED;\n"
+       "                }\n"
+       "                v.setPadding(insets.getSystemWindowInsetLeft(), insets.getSystemWindowInsetTop(),\n"
+       "                        insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());\n"
+       "                return insets.consumeSystemWindowInsets();\n"
+       "            }\n"
+       "        });\n"
+       "        setContentView(root);\n"
+       "        if (Build.VERSION.SDK_INT >= 33) {\n"
+       "            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(\n"
+       "                    android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,\n"
+       "                    new android.window.OnBackInvokedCallback() {\n"
+       "                        @Override\n"
+       "                        public void onBackInvoked() {\n"
+       "                            handleBack();\n"
+       "                        }\n"
+       "                    });\n"
+       "        }\n"
+       "    }\n\n"
+       ;; System Back. Unhandled, android.app.Activity closed the app from any
+       ;; depth of in-page navigation. Now: the page first gets a cancelable
+       ;; `kotobaShell:back` event on window (preventDefault() = the page
+       ;; handled it, e.g. closed a sheet or popped its own router); then
+       ;; WebView history; only then does the app leave, the way a root
+       ;; Activity does by default since Android 12 (task to back, not
+       ;; finish). API 33+ through OnBackInvokedDispatcher
+       ;; (android:enableOnBackInvokedCallback in the manifest), older
+       ;; releases through onBackPressed.
+       "    private static final String BACK_EVENT_SCRIPT =\n"
+       "            \"(function(){var e=new CustomEvent('kotobaShell:back',{cancelable:true});\"\n"
+       "            + \"window.dispatchEvent(e);return e.defaultPrevented;})()\";\n\n"
+       "    private void handleBack() {\n"
+       "        final WebView view = webView;\n"
+       "        if (view == null) {\n"
+       "            leave();\n"
+       "            return;\n"
+       "        }\n"
+       "        view.evaluateJavascript(BACK_EVENT_SCRIPT, new android.webkit.ValueCallback<String>() {\n"
+       "            @Override\n"
+       "            public void onReceiveValue(String handled) {\n"
+       "                if (\"true\".equals(handled)) {\n"
+       "                    return;\n"
+       "                }\n"
+       "                if (view.canGoBack()) {\n"
+       "                    view.goBack();\n"
+       "                } else {\n"
+       "                    leave();\n"
+       "                }\n"
+       "            }\n"
+       "        });\n"
+       "    }\n\n"
+       "    private void leave() {\n"
+       "        if (isTaskRoot()) {\n"
+       "            moveTaskToBack(false);\n"
+       "        } else {\n"
+       "            finish();\n"
+       "        }\n"
+       "    }\n\n"
+       "    @Override\n"
+       "    @SuppressWarnings(\"deprecation\")\n"
+       "    public void onBackPressed() {\n"
+       "        handleBack();\n"
+       "    }\n\n"
+       "    @Override\n"
+       "    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {\n"
+       "        super.onRequestPermissionsResult(requestCode, permissions, grantResults);\n"
+       "        if (bridge != null) {\n"
+       "            bridge.onRequestPermissionsResult(requestCode);\n"
+       "        }\n"
        "    }\n"
        "}\n"))
 
@@ -1244,7 +1839,8 @@
   `scaffold-files*` and dropped here."
   [target manifest policy]
   (let [android-oauth-scheme (bridge/oauth-callback-scheme :android manifest)]
-    (vec (remove nil? (scaffold-files* target manifest policy android-oauth-scheme)))))
+    (vec (remove nil? (concat (scaffold-files* target manifest policy android-oauth-scheme)
+                              (store-resource-files target manifest))))))
 
 (defn- scaffold-files*
   [target manifest policy android-oauth-scheme]
@@ -1265,6 +1861,7 @@
           ["Sources/WebBundleSchemeHandler.swift" web-bundle-scheme-handler-swift]
           ["Sources/KotobaShellBridge.swift" (bridge/apple-bridge-swift target manifest)]
           ["Sources/AppDelegate.swift" ios-app-delegate-swift]
+          ["Sources/ExternalNavigationPolicy.swift" ios-external-navigation-swift]
           ["Resources/kotoba-shell-bridge.js" (bridge/bridge-js target)]
           ["Resources/kotoba-shell-policy.json" (bridge-policy-json target policy)]
           ["Resources/kotoba-shell.edn"
@@ -1305,7 +1902,7 @@
                     "        minSdk 26\n"
                     "        targetSdk 35\n"
                     "        versionName '" (:app/version manifest) "'\n"
-                    "        versionCode " (or (:android/version-code manifest) 1) "\n"
+                    "        versionCode " (android-version-code manifest) "\n"
                     "    }\n"
                     "    signingConfigs {\n"
                     "        release {\n"
@@ -1324,6 +1921,15 @@
                     "                signingConfig signingConfigs.release\n"
                     "            }\n"
                     "        }\n"
+                    "    }\n"
+                    ;; aapt's default ignoreAssetsPattern drops every asset
+                    ;; whose name starts with '.' (and directories starting
+                    ;; with '_'), so a bundle's
+                    ;; /.well-known/shinkansen/receipts.json shipped on iOS
+                    ;; and silently vanished from the APK -- the app showed
+                    ;; its CID as '?'. Only the VCS/OS litter stays ignored.
+                    "    androidResources {\n"
+                    "        ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'\n"
                     "    }\n"
                     "    compileOptions {\n"
                     "        sourceCompatibility JavaVersion.VERSION_17\n"
@@ -1352,7 +1958,11 @@
               ["app/src/main/AndroidManifest.xml"
                (str "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n"
                     "  <uses-permission android:name=\"android.permission.INTERNET\" />\n"
-                    "  <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />\n"
+                    ;; Declared only when the policy allows notify/show: a
+                    ;; permission the app can never use is one more thing a
+                    ;; Play review and a person reading the listing ask about.
+                    (when (:allowed? (policy-decision policy :android "notify/show"))
+                      "  <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />\n")
                     ;; Android 11+ package visibility hides Custom Tabs
                     ;; providers unless the app declares it looks for them;
                     ;; without this CustomTabsClient.getPackageName is always
@@ -1363,7 +1973,28 @@
                            "      <action android:name=\"android.support.customtabs.action.CustomTabsService\" />\n"
                            "    </intent>\n"
                            "  </queries>\n"))
-                    "  <application android:label=\"" (xml-escape (:app/name manifest)) "\" android:usesCleartextTraffic=\"true\">\n"
+                    "  <application android:label=\"" (xml-escape (:app/name manifest)) "\"\n"
+                    "               android:theme=\"@style/KotobaShellTheme\"\n"
+                    ;; Back reaches MainActivity's OnBackInvokedCallback on
+                    ;; API 33+ (onBackPressed below that); see handleBack.
+                    "               android:enableOnBackInvokedCallback=\"true\"\n"
+                    (when (or (:android/icon manifest) (:android/adaptive-icon manifest))
+                      "               android:icon=\"@mipmap/ic_launcher\"\n")
+                    (when (:android/adaptive-icon manifest)
+                      "               android:roundIcon=\"@mipmap/ic_launcher_round\"\n")
+                    ;; Off unless the manifest opts in: the keychain values
+                    ;; are encrypted under an AndroidKeyStore key that is
+                    ;; never backed up, so a restored copy could not be
+                    ;; decrypted on the new device anyway.
+                    "               android:allowBackup=\"" (if (:android/allow-backup? manifest) "true" "false") "\"\n"
+                    ;; Cleartext HTTP off: the bundle is served from an
+                    ;; https origin (WebViewAssetLoader) and the bridge's
+                    ;; http/fetch is meant for HTTPS APIs. It used to be on
+                    ;; for every app. `:android/cleartext-traffic? true` is the
+                    ;; opt-in for a development build that talks to a local
+                    ;; server (10.0.2.2 from the emulator).
+                    "               android:usesCleartextTraffic=\""
+                    (if (:android/cleartext-traffic? manifest) "true" "false") "\">\n"
                     "    <activity android:name=\".MainActivity\" android:exported=\"true\">\n"
                     "      <intent-filter>\n"
                     "        <action android:name=\"android.intent.action.MAIN\" />\n"
@@ -1457,36 +2088,47 @@
        :xcodegen-error (host/error-message e)})))
 
 (defn scaffold-target-row
-  [output-dir manifest policy target]
-  (let [missing (missing-manifest-keys target manifest)
-        invalid (invalid-manifest-keys target manifest)
-        known? (contains? supported-shell-targets target)
-        root (host/file output-dir (name target))
-        ok? (and known? (empty? missing) (empty? invalid))
-        files (when ok? (scaffold-files target manifest policy))]
-    (if-not ok?
-      {:target target
-       :ok? false
-       :root (.getPath root)
-       :missing-manifest-keys (or missing [])
-       :invalid-manifest-keys invalid
-       :reason (if known? :manifest-invalid :unknown-target)}
-      (do
-        (doseq [[path body] files]
-          (write-text-file! (host/file root path) body))
-        (let [web-result (web-assets-into! manifest (web-assets-dest target root))
-              xcodegen-result (when (#{:macos :ios} target)
-                                (xcodegen-generate! root))]
-          (merge
-           {:target target
-            :ok? (and ok? (or (nil? xcodegen-result) (:xcodegen-ok? xcodegen-result)))
-            :root (.getPath root)
-            :files (mapv first files)
-            :file-count (count files)
-            :surface (get surface-host-specs target)
-            :web-assets web-result
-            :manifest manifest}
-           xcodegen-result))))))
+  "`base-dir` is where the manifest's relative icon paths resolve
+  (manifest-base-dir); the 4-arity resolves them against the working
+  directory."
+  ([output-dir manifest policy target]
+   (scaffold-target-row output-dir manifest policy target "."))
+  ([output-dir manifest policy target base-dir]
+   (let [missing (missing-manifest-keys target manifest)
+         invalid (into (invalid-manifest-keys target manifest)
+                       (icon-problems target manifest base-dir))
+         known? (contains? supported-shell-targets target)
+         root (host/file output-dir (name target))
+         ok? (and known? (empty? missing) (empty? invalid))
+         files (when ok? (scaffold-files target manifest policy))]
+     (if-not ok?
+       {:target target
+        :ok? false
+        :root (.getPath root)
+        :missing-manifest-keys (or missing [])
+        :invalid-manifest-keys invalid
+        :reason (if known? :manifest-invalid :unknown-target)}
+       (do
+         (doseq [[path body] files]
+           (write-text-file! (host/file root path) body))
+         (let [web-result (web-assets-into! manifest (web-assets-dest target root))
+               ;; Before xcodegen: it decides what the asset catalog holds
+               ;; from what is on disk when it runs.
+               icon-result (write-icon-images! target manifest base-dir root)
+               xcodegen-result (when (#{:macos :ios} target)
+                                 (xcodegen-generate! root))]
+           (merge
+            {:target target
+             :ok? (and ok? (or (nil? xcodegen-result) (:xcodegen-ok? xcodegen-result)))
+             :root (.getPath root)
+             :files (mapv first files)
+             :file-count (count files)
+             :surface (get surface-host-specs target)
+             :web-assets web-result
+             :icon-images icon-result
+             :store-warnings (store-warnings target manifest)
+             :manifest manifest}
+            xcodegen-result)))))))
 
 (defn scaffold-check-row
   [output-dir manifest policy target]
@@ -1506,7 +2148,8 @@
         ;; 見える。
         web-bundle-paths (when (#{:macos :ios} target)
                            ["Resources/WebBundle/index.html"])
-        files (concat (mapv first (scaffold-files target manifest policy)) xcodeproj-paths web-bundle-paths)
+        files (concat (mapv first (scaffold-files target manifest policy)) xcodeproj-paths web-bundle-paths
+                      (icon-check-paths target manifest))
         file-rows (mapv (fn [path]
                           {:path path
                            :present? (.isFile (host/file root path))})
@@ -1588,7 +2231,8 @@
                     [:macos :ios :android])
         manifest (app-manifest argv)
         output-dir (app-output-dir argv)
-        rows (mapv #(scaffold-target-row output-dir manifest (provider-policy argv) %) targets)
+        base-dir (manifest-base-dir argv)
+        rows (mapv #(scaffold-target-row output-dir manifest (provider-policy argv) % base-dir) targets)
         ok? (every? :ok? rows)]
     {:kotoba.cli/ok? ok?
      :kotoba.cli/code (if ok? :shell/app-scaffolded :shell/app-scaffold-blocked)

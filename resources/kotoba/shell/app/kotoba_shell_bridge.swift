@@ -106,8 +106,10 @@ final class KotobaShellBridge: NSObject, WKScriptMessageHandlerWithReply,
     /// Not from inside `notify/show`: `requestAuthorization` only calls back
     /// after someone answers the system dialog, so a provider call that
     /// requested inline would block for as long as the dialog stood open and
-    /// its result would depend on how fast a person tapped. Android's
-    /// MainActivity asks at startup for the same reason. Only asked when the
+    /// its result would depend on how fast a person tapped. (Android now
+    /// asks at the first notify/show and waits for the answer instead --
+    /// KotobaShellBridge.java ensureNotificationPermission; iOS has not
+    /// followed yet.) Only asked when the
     /// policy actually allows `notify/show` — an app that never notifies
     /// should not greet its user with a permission sheet.
     func requestNotificationAuthorizationIfAllowed() {

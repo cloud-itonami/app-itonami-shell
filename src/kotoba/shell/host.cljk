@@ -133,6 +133,24 @@
              (.appendFileSync fs (path-of x) (str content))
              (.writeFileSync fs (path-of x) (str content)))))
 
+(defn read-file-bytes
+  "Every byte of a file as a vector of unsigned ints (0-255). For small
+  binary inputs the launcher inspects without decoding — app icon PNG
+  headers — so both hosts read them the same way."
+  [x]
+  #?(:clj (mapv #(bit-and (int %) 0xff)
+                (java.nio.file.Files/readAllBytes (.toPath (io/file (path-of x)))))
+     :cljs (vec (js/Array.from (.readFileSync fs (path-of x))))))
+
+(defn write-file-bytes!
+  "Writes a sequence of unsigned ints (0-255) as the file's bytes."
+  [x byte-values]
+  #?(:clj (java.nio.file.Files/write (.toPath (io/file (path-of x)))
+                                     ^bytes (byte-array (map unchecked-byte byte-values))
+                                     ^"[Ljava.nio.file.OpenOption;" (into-array java.nio.file.OpenOption []))
+     :cljs (.writeFileSync fs (path-of x) (.from js/Buffer (clj->js (vec byte-values)))))
+  x)
+
 (defn file-seq*
   "clojure.core/file-seq over a path or host file (does not follow symlinked
   directories on the Node host)."
